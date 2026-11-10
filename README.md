@@ -5,9 +5,10 @@ se traduce a C++ y se compila para ARM64, con un renderer Vulkan nativo. No es u
 **Jauidev**, hecho con la herramienta de este repositorio que lleva un juego de Xbox 360 del disco a un APK.
 Sigue a [Gears3Recomp](https://github.com/Jauidev/Gears3Recomp), el port de Gears of War 3.
 
-> **No incluye el juego ni nada que salga de él** (ni el código recompilado, ni sus shaders, ni sus
-> bibliotecas, ni ningún dato del disco): todo eso se genera desde tu propia copia del disco de Halo 3 para
-> Xbox 360. Tampoco se distribuye aquí ninguna APK con el juego dentro.
+> **No incluye el juego.** El código fuente de este repositorio no lleva nada que salga de él (ni el código
+> recompilado, ni sus shaders, ni sus bibliotecas): eso se genera desde tu propia copia del disco de Halo 3
+> para Xbox 360. La APK de Releases es el port ya compilado, sin ningún dato del disco: no arranca sin tu
+> propia ISO o disco extraído.
 > Halo y sus marcas pertenecen a Microsoft. Este proyecto no está afiliado a Microsoft, Bungie ni
 > Halo Studios (343 Industries), ni cuenta con su aprobación. Necesitas una copia legítima del juego.
 
@@ -21,19 +22,23 @@ Sigue a [Gears3Recomp](https://github.com/Jauidev/Gears3Recomp), el port de Gear
   las pipelines ya creadas se guardan en disco para la siguiente sesión.
 - Controles táctiles y mandos físicos por Bluetooth o USB (Xbox, PlayStation y la mayoría de mandos
   Android), a la vez.
-- Launcher propio, con su fondo y sus colores.
-- Probado solo en parte de la campaña y solo en una GPU Mali.
+- Las pipelines que el port ya conoce se preparan al arrancar, y las nuevas se compilan en los núcleos de
+  eficiencia sin quitarle tiempo al juego; aun así, la primera vez que se entra en una zona pueden bajar los
+  fps o tardar en aparecer algún objeto.
+- Launcher propio, con su fondo y sus colores. En **GPU y drivers** (móviles Adreno) se elige el driver
+  Vulkan: el del sistema, uno de los Mesa Turnip incluidos (27.0.0-R2, 27.0.0-R2 para One UI, Gen8 V39 y
+  26.0.0 R8) o uno importado en `.zip`.
+- Probado solo en parte de la campaña y solo en una GPU Mali (Mali-G615). En Adreno no se ha probado.
+- Hace falta un móvil potente: en uno de 4 GB de RAM con Adreno 610 no es jugable.
 
 ## Instalar en Android
 
-Este repositorio no publica APK: se compila con tu propio disco (ver [Compilar](#compilar)). Con la APK ya
-hecha (arm64, Android 10 o superior, Vulkan):
-
-1. Instálala y ábrela.
-2. En el launcher elige la ISO del juego o la carpeta del disco extraído. También puedes copiar el disco
+1. Descarga la APK de [Releases](../../releases) (arm64, Android 10 o superior, Vulkan).
+2. Instálala y ábrela.
+3. En el launcher elige la ISO del juego o la carpeta del disco extraído. También puedes copiar el disco
    extraído a `/sdcard/Android/data/com.xport.halo3/files/game`.
 
-En Adreno, el launcher puede usar Mesa Turnip si el driver del sistema no sirve.
+En Adreno, el launcher usa Mesa Turnip si el driver del sistema no sirve.
 
 ## Compilar
 
