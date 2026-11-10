@@ -124,6 +124,10 @@
 #include "native_pipeline_policy.h"
 #include "native_pipeline_compiler.h"
 #include "native_pipeline_recipe.h"
+#ifdef __ANDROID__
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 #include "native_spirv_reflection.h"
 #include "native_stencil_volume_policy.h"
 #include "hdr_present_ps.h"
@@ -622,6 +626,22 @@ REXCVAR_DEFINE_UINT32(
     "With xnative_async_pipelines: microseconds per frame that draws may wait for their "
     "pipelines before being skipped")
     .range(0, 1000000);
+// Halo 3 on the Mali (2026-11-10): entering an area nobody has drawn yet queues tens of first-use
+// compiles of 15-65 ms each, and the frame rate dropped until they were done, for two reasons
+// these two settings remove. The image is the same once the pipelines exist; their draws stay
+// skipped somewhat longer.
+REXCVAR_DEFINE_BOOL(
+    xnative_async_pipeline_wait_once, true, "Xcompiler/Graphics/Native Renderer",
+    "With xnative_async_pipelines: after a frame skipped a draw, the following frames do not "
+    "wait for pipelines at all until one frame skips none (the wait budget is paid once per "
+    "burst of compiles instead of every frame of it)");
+REXCVAR_DEFINE_UINT32(
+    xnative_pipeline_compile_nice, 10, "Xcompiler/Graphics/Native Renderer",
+    "Android: not 0 names the background pipeline compile workers XpPipeCompile, which the "
+    "runtime's thread placement keeps on the little cores at low priority; 0 leaves them "
+    "unnamed, placed on the big cores beside the recorder while they are busy")
+    .range(0, 19)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 
 
@@ -3145,7 +3165,10 @@ struct NativeGraphicsSystem::NativePipelineCompilerState {
   uint64_t replay_scanned_generation = 0;
   bool replay_retry = false;
   std::atomic<uint64_t> checkpoint_tick{0};
-  static constexpr size_t kMaximumRecipes = 4096;
+  // Halo 3 (2026-11-10): 4096 before. A pipeline past the cap has no recipe, so every run
+  // compiles it at its first draw again (frame rate drops entering an area).
+  static constexpr size_t kMaximumRecipes = 16384;
+  std::atomic<bool> recipes_full_reported{false};
 };
 
 size_t NativeGraphicsSystem::NativePipelineKeyHash::operator()(
@@ -15055,7 +15078,21 @@ bool NativeGraphicsSystem::InitializeNativeRendererObjects() {
 #endif
   REXLOG_INFO("xnative-pipeline: {} background compile worker(s)", pipeline_compile_threads);
   native_pipeline_compiler_->compiler = std::make_unique<NativePipelineCompilerState::Compiler>(
-      64, [this] { ScheduleNativePipelineCheckpoint(); }, pipeline_compile_threads);
+      64, [this] { ScheduleNativePipelineCheckpoint(); }, pipeline_compile_threads, [] {
+#ifdef __ANDROID__
+        // The runtime's placement thread (runtime/os/thread_policy.cpp) sets every thread's cores
+        // and priority from its name once a second. Unnamed, a worker kept its creator's name,
+        // counted as a busy thread while it compiled and was moved to the two big cores the
+        // recorder, the sound and the render worker share, at their priority (nice -6): three
+        // compiles at once took the recorder's time, which is the frame rate. "Compile" in the
+        // name is one of the policy's little-core names (the four Cortex-A510, nice 4).
+        // xnative_pipeline_compile_nice 0 leaves the workers as they were.
+        if (REXCVAR_GET(xnative_pipeline_compile_nice)) {
+          pthread_setname_np(pthread_self(), "XpPipeCompile");
+          setpriority(PRIO_PROCESS, id_t(gettid()), int(REXCVAR_GET(xnative_pipeline_compile_nice)));
+        }
+#endif
+      });
   LoadNativePipelineRecipes();
   ReplayNativePipelineRecipes();
   return true;
@@ -15232,18 +15269,6 @@ void NativeGraphicsSystem::LoadNativePipelineRecipes() {
   }
   auto path = native_pipeline_cache_path_;
   path += ".recipes";
-  auto bytes = ReadBinaryFile(path);
-  const bool seed = !bytes;
-  if (seed) {
-    const auto embedded = NativePipelineRecipeSeed();
-    if (embedded.empty()) {
-      return;
-    }
-    bytes.emplace(embedded.begin(), embedded.end());
-  }
-  if (bytes->size() < sizeof(NativePipelineRecipeFileHeader) || bytes->size() > 16777216) {
-    return;
-  }
   const auto* device = static_cast<ui::vulkan::VulkanProvider*>(provider_.get())->vulkan_device();
   // The seed's recipes come from another GPU: only those this one can render to.
   const auto renders_to = [&](const NativePipelineKey& key) {
@@ -15263,21 +15288,29 @@ void NativeGraphicsSystem::LoadNativePipelineRecipes() {
                        }) &&
            supports(key.depth_format, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
   };
+  // One set of recipes: the device's own file, or the port's seed (seed: from another GPU).
+  const auto load = [&](std::span<const uint8_t> bytes, bool seed) -> size_t {
   size_t loaded = 0;
+  if (bytes.size() < sizeof(NativePipelineRecipeFileHeader) ||
+      bytes.size() > sizeof(NativePipelineRecipeFileHeader) +
+                         NativePipelineCompilerState::kMaximumRecipes *
+                             sizeof(NativePipelineCompilerState::Record)) {
+    return 0;
+  }
   NativePipelineRecipeFileHeader header{};
-  std::memcpy(&header, bytes->data(), sizeof(header));
-  const size_t payload_size = bytes->size() - sizeof(header);
+  std::memcpy(&header, bytes.data(), sizeof(header));
+  const size_t payload_size = bytes.size() - sizeof(header);
   if (header.schema != 1 || header.build != NativePipelineRecipeBuildIdentity() ||
       header.record_size != sizeof(NativePipelineCompilerState::Record) ||
       header.count > NativePipelineCompilerState::kMaximumRecipes ||
       payload_size != header.count * sizeof(NativePipelineCompilerState::Record) ||
-      header.checksum != XXH3_64bits(bytes->data() + sizeof(header), payload_size)) {
-    return;
+      header.checksum != XXH3_64bits(bytes.data() + sizeof(header), payload_size)) {
+    return 0;
   }
-  for (size_t offset = sizeof(header); offset < bytes->size();
+  for (size_t offset = sizeof(header); offset < bytes.size();
        offset += sizeof(NativePipelineCompilerState::Record)) {
     NativePipelineCompilerState::Record record{};
-    std::memcpy(&record, bytes->data() + offset, sizeof(record));
+    std::memcpy(&record, bytes.data() + offset, sizeof(record));
     {
       // clip_plane_emulation sits in what was padding: a record from before it may hold any byte.
       uint8_t emulation = 0;
@@ -15295,14 +15328,23 @@ void NativeGraphicsSystem::LoadNativePipelineRecipes() {
       // registered yet (or this descriptor backend selected yet) to retain its
       // learned recipe for a later loading boundary.
       std::lock_guard lock(native_pipeline_compiler_->records_mutex);
-      if (native_pipeline_compiler_->records.emplace(record.key, record.recipe).second) {
+      if (native_pipeline_compiler_->records.size() < NativePipelineCompilerState::kMaximumRecipes &&
+          native_pipeline_compiler_->records.emplace(record.key, record.recipe).second) {
         native_pipeline_compiler_->replay.push_back(record);
         ++loaded;
       }
     }
   }
-  REXLOG_INFO("xnative: {} pipeline recipes from {}", loaded,
-              seed ? "the port's seed" : path.string());
+  return loaded;
+  };
+  // The device's file first: its recipes are this GPU's own. Then the seed's that it lacks, so
+  // an update brings the areas the port has learned since to a device that already has a file.
+  if (const auto bytes = ReadBinaryFile(path)) {
+    REXLOG_INFO("xnative: {} pipeline recipes from {}", load(*bytes, false), path.string());
+  }
+  if (const auto embedded = NativePipelineRecipeSeed(); !embedded.empty()) {
+    REXLOG_INFO("xnative: {} pipeline recipes from the port's seed", load(embedded, true));
+  }
 }
 
 // xnative_strip_unread_vertex_outputs (native_spirv_vertex_outputs.h). Measured on 2026-11-09
@@ -15533,6 +15575,15 @@ std::chrono::microseconds NativeGraphicsSystem::NativePipelineAsyncWaitBudget() 
   const uint64_t budget_ticks =
       uint64_t(REXCVAR_GET(xnative_async_pipeline_frame_wait_us)) * frequency / 1000000;
   if (native_pipeline_async_waited_ticks_ >= budget_ticks) {
+    return std::chrono::microseconds(0);
+  }
+  // xnative_async_pipeline_wait_once: this frame or the one before skipped a draw, so compiles
+  // longer than the budget are running. Waiting again would cost every frame of the burst the
+  // whole budget for nothing; a pipeline that finishes is published without a wait anyway
+  // (DrainNativePipelineCompiles).
+  if (REXCVAR_GET(xnative_async_pipeline_wait_once) &&
+      native_pipeline_async_last_skip_frame_ != UINT32_MAX &&
+      diagnostic_submitted_frame_ - native_pipeline_async_last_skip_frame_ <= 1) {
     return std::chrono::microseconds(0);
   }
   return std::chrono::microseconds(
@@ -20538,6 +20589,9 @@ VkPipeline NativeGraphicsSystem::GetOrCreatePipeline(
         std::lock_guard lock(native_pipeline_compiler_->records_mutex);
         if (native_pipeline_compiler_->records.size() < NativePipelineCompilerState::kMaximumRecipes) {
           native_pipeline_compiler_->records.emplace(key, recipe->data);
+        } else if (!native_pipeline_compiler_->recipes_full_reported.exchange(true)) {
+          REXLOG_WARN("xnative: {} pipeline recipes, the limit: later pipelines are not remembered",
+                      native_pipeline_compiler_->records.size());
         }
       }
       // xnative_async_pipelines: a key whose background compile just failed above is not queued

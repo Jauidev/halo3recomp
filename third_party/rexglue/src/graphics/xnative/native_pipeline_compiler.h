@@ -24,11 +24,17 @@ template <typename Key, typename Result, typename Hash>
 class NativePipelineCompiler {
  public:
   using Compile = std::function<Result()>;
+  // `started` runs on each worker before its first job (the caller sets the thread's priority).
   explicit NativePipelineCompiler(size_t capacity, std::function<void()> idle = {},
-                                  size_t threads = 1)
+                                  size_t threads = 1, std::function<void()> started = {})
       : capacity_(std::max<size_t>(capacity, 1)), idle_(std::move(idle)) {
     for (size_t i = 0; i < std::max<size_t>(threads, 1); ++i) {
-      threads_.emplace_back([this] { Run(); });
+      threads_.emplace_back([this, started] {
+        if (started) {
+          started();
+        }
+        Run();
+      });
     }
   }
   ~NativePipelineCompiler() { Stop(); }

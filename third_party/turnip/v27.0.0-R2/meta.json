@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "name": "Turnip 27.0.0-R2",
+  "description": "StevenMXZ A7xx Android/Bionic",
+  "author": "StevenMXZ",
+  "packageVersion": "34",
+  "vendor": "Mesa",
+  "driverVersion": "Vulkan 1.4.367",
+  "minApi": 28,
+  "libraryName": "libvulkan_freedreno.so"
+}

@@ -28,7 +28,11 @@ esac
 # The app's name on the phone: XPORT_APP_LABEL in the game's game.cmake, else the folder name.
 LABEL=$(sed -n 's/^set(XPORT_APP_LABEL "\(.*\)")/\1/p' "$ROOT/games/$GAME/game.cmake")
 LABEL="${LABEL:-$GAME}"
-TURNIP="$ROOT/third_party/turnip/v26.0.0-R8/vulkan.ad07xx.so"
+TURNIP="$ROOT/third_party/turnip/v27.0.0-R2/libvulkan_freedreno.so"
+# The other drivers go in the APK as their AdrenoTools .zip
+# (assets/drivers/<id>.zip); MainActivity unpacks them into files/drivers/<id>/ on an Adreno phone,
+# where the launcher lists them beside the imported ones.
+BUNDLED_DRIVERS="turnip-gen8-v39=$ROOT/third_party/turnip/gen8-v39/Turnip_Gen8_V39_Patched.zip;turnip-v26.0.0-r8=$ROOT/third_party/turnip/v26.0.0-R8/Turnip_v26.0.0_R8.zip;turnip-v27.0.0-r2-oneui=$ROOT/third_party/turnip/v27.0.0-R2-oneui/Turnip_v27.0.0-R2-SAMSUNG.zip"
 HOOKS="$BUILD/third_party/libadrenotools/src/hook"
 
 rm -rf "$OUT"
@@ -106,7 +110,7 @@ GAME_BG="$ROOT/games/$GAME/LAUNCHER/FONDO.png"
 # The libraries keep the source paths of __FILE__ (asserts, logs): the folder the project was built in
 # (and its parent) becomes a relative path of the same length ("././.../third_party/..."), so an APK
 # does not carry the builder's folders.
-py -3 - "$ROOT" "$OUT" "$LAUNCHER" "$UI_FONT" "$GAME_BG" "${LAYERS[@]}" <<'EOF'
+BUNDLED_DRIVERS="$BUNDLED_DRIVERS" py -3 - "$ROOT" "$OUT" "$LAUNCHER" "$UI_FONT" "$GAME_BG" "${LAYERS[@]}" <<'EOF'
 import sys, zipfile, os, re
 root, out, launcher, ui_font, game_bg, layers = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 
@@ -141,6 +145,10 @@ with zipfile.ZipFile(os.path.join(out, "base.apk"), "a", zipfile.ZIP_DEFLATED) a
     apk.write(mali, "assets/launcher/bg_mali.png", zipfile.ZIP_STORED)
     apk.write(adreno, "assets/launcher/bg_adreno.png", zipfile.ZIP_STORED)
     apk.write(ui_font, "assets/launcher/Roboto-Medium.ttf")
+    for item in os.environ.get("BUNDLED_DRIVERS", "").split(";"):
+        name, _, path = item.partition("=")
+        if name and os.path.isfile(path):
+            apk.write(path, "assets/drivers/" + name + ".zip", zipfile.ZIP_STORED)
 EOF
 
 "$BT/zipalign.exe" -f -p 4 "$OUT/base.apk" "$OUT/aligned.apk"

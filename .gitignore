@@ -5,3 +5,4 @@ __pycache__/
 /games/*/ppc/
 /games/*/dlls/
 /games/*/data/shader/
+/games/*/data/pipeline_recipes.bin

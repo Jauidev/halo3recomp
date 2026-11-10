@@ -14,6 +14,9 @@
 #include <imgui_internal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <android/api-level.h>
+#endif
 #include <ctime>
 #include <deque>
 #include <unordered_map>
@@ -83,7 +86,7 @@ namespace
         {"smol-v", "Compresión SPIR-V · Aras Pranckevicius"},
         {"volk", "Carga de Vulkan · Arseny Kapoulkine"},
         {"SMAA", "Antialiasing · Jorge Jimenez"},
-        {"Mesa Turnip", "Driver Adreno · builds de KIMCHI"},
+        {"Mesa Turnip", "Driver Adreno · builds de KIMCHI y StevenMXZ"},
         {"libadrenotools", "Carga de drivers · bylaws"},
         {"libGPUCounters", "Contadores de GPU · Arm"},
         {"FFmpeg", "Audio XMA · FFmpeg"},
@@ -100,7 +103,7 @@ namespace
         {"Khronos · LunarG", "Validation layers y GFXReconstruct"},
     };
 
-    constexpr const char* kTurnipName = "Turnip v26.0.0 R8";
+    constexpr const char* kTurnipName = "Turnip 27.0.0-R2";
     constexpr int kAutoBackupsKept = 10;
 
     struct Config
@@ -155,6 +158,7 @@ namespace
     {
         std::string id, name, dir, library;
         bool usable = true;
+        bool bundled = false; // came in the APK (MainActivity.installBundledDrivers): not deletable
         std::string problem;
     };
 
@@ -446,8 +450,20 @@ namespace
             const size_t digits = version.find_first_of("0123456789");
             if (digits != std::string::npos)
                 sscanf(version.c_str() + digits, "%d.%d", &major, &minor);
+            driver.bundled = access((driver.dir + ".bundled").c_str(), F_OK) == 0;
+            // "minApi": 36 (a number): the Android version the driver's libraries were built for.
+            [[maybe_unused]] int minApi = 0;
+            if (const size_t key = meta.find("\"minApi\""); key != std::string::npos)
+            {
+                if (const size_t colon = meta.find(':', key); colon != std::string::npos)
+                    minApi = atoi(meta.c_str() + colon + 1);
+            }
             if (driver.library.empty() || access((driver.dir + driver.library).c_str(), R_OK) != 0)
                 driver.problem = Tr("Falta la librería del driver");
+#ifdef __ANDROID__
+            else if (minApi > android_get_device_api_level())
+                driver.problem = Trf("Necesita Android con API {} (este tiene {})", minApi, android_get_device_api_level());
+#endif
             else if (major == 1 && minor < 2)
                 driver.problem = Trf("Vulkan {}.{}: necesita 1.2", major, minor);
             driver.usable = driver.problem.empty();
@@ -1669,11 +1685,18 @@ namespace
         {
             const Driver& driver = g.drivers[i];
             ImGui::PushID(int(i));
-            const float remove = ConfirmWidth("Borrar") + Dp(14);
+            const float remove = driver.bundled ? 0.0f : ConfirmWidth("Borrar") + Dp(14);
             // An unusable one says so in its tag; its problem goes to the log.
             if (ChoiceRow(grid, "##driver", driver.name, g.config.driver == driver.id, driver.usable,
-                    driver.usable ? "Importado" : "No compatible", driver.usable ? White(0.2f) : Rgba(220, 60, 60, 0.9f), remove))
+                    !driver.usable ? "No compatible" : driver.bundled ? "Incluido" : "Importado",
+                    !driver.usable ? Rgba(220, 60, 60, 0.9f) : driver.bundled ? Accent(0.6f) : White(0.2f), remove))
                 ChooseDriver(driver.id);
+            // One the APK carries would be unpacked again at the next start: no Borrar.
+            if (driver.bundled)
+            {
+                ImGui::PopID();
+                continue;
+            }
             // The row just placed: Place has moved past it in its row.
             const ImVec2 at = grid.origin + ImVec2((grid.column - 1) * (grid.CellWidth() + grid.gap), grid.y);
             const float height = ChoiceHeight();

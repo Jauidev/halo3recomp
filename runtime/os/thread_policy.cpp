@@ -112,6 +112,12 @@ namespace
         // The texture disk cache's file work (native_texture_disk_cache.cpp): busy while the cache
         // fills, and nothing waits for it.
         "XpTexCache",
+        // The background shader translation (shader_translator.cpp) and pipeline compiles
+        // (graphics_system.cpp, XpPipeCompile matches "Compile" above). Halo 3, 2026-11-10: with
+        // no name here they counted as busy threads and were moved to the two big cores the
+        // recorder, the sound and the render worker share, at nice -6, each time a new area
+        // brought shaders and pipelines: the frame rate dropped until they were done.
+        "ShaderXlate",
     };
 
     constexpr double PROMOTE_SHARE = 0.10; // of one core (10% promotes to Big)
@@ -213,6 +219,9 @@ namespace
         bool enabled = false;
         int prime = -1;
         int render = -1;
+        int primeCapacity = 0;
+        int reference = -1;        // a big core beside the prime one (PrimeThrottled)
+        int referenceCapacity = 0;
         cpu_set_t primeOnly{};
         cpu_set_t renderOnly{};
         cpu_set_t big{};        // big cores except the prime and render ones
@@ -295,6 +304,15 @@ namespace
             else
             {
                 layout.renderOnly = layout.big;
+            }
+            layout.primeCapacity = best;
+            for (int cpu = 0; cpu < count && cpu < CPU_SETSIZE && layout.reference < 0; cpu++)
+            {
+                if (cpu != layout.prime && CPU_ISSET(cpu, &layout.allBig))
+                {
+                    layout.reference = cpu;
+                    layout.referenceCapacity = capacities[cpu];
+                }
             }
             layout.enabled = true;
             LOGFN("affinity: main thread on core {} (capacity {}), render thread on core {}, {} big cores beside them, {} little cores",
@@ -413,6 +431,60 @@ namespace
         return cpu >= 0;
     }
 
+    long ReadCpuFrequency(int cpu, const char* file)
+    {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/%s", cpu, file);
+        FILE* handle = fopen(path, "r");
+        if (!handle)
+            return -1;
+        long value = -1;
+        if (fscanf(handle, "%ld", &value) != 1)
+            value = -1;
+        fclose(handle);
+        return value;
+    }
+
+    // Hot, the thermal limit takes the fastest core lower than the other big ones (seen on this
+    // phone: 0.9-1.2 GHz against 1.9, see layout mode C above), and core_ctl does not pause it, so
+    // the main thread stayed alone on what had become the slowest big core. Each core's speed
+    // under the limit is its capacity scaled by scaling_max_freq / cpuinfo_max_freq; the fastest
+    // core counts as throttled under 80% of another big core's and as recovered over 90%. Read once
+    // a second. files/thermal_main_mode starting with 'B' turns the check off; a file that cannot
+    // be read leaves the placement as it was.
+    bool PrimeThrottled(std::chrono::steady_clock::time_point now)
+    {
+        static bool s_throttled = false;
+        static std::chrono::steady_clock::time_point s_next;
+        if (now < s_next)
+            return s_throttled;
+        s_next = now + std::chrono::seconds(1);
+        const Layout& layout = GetLayout();
+        static const std::string path = []
+        {
+            const char* save = getenv("XPORT_SAVE_DIR");
+            return std::string(save ? save : ".") + "/../thermal_main_mode";
+        }();
+        bool off = false;
+        if (FILE* file = fopen(path.c_str(), "r"))
+        {
+            off = fgetc(file) == 'B';
+            fclose(file);
+        }
+        if (off || layout.reference < 0)
+            return s_throttled = false;
+        const long primeLimit = ReadCpuFrequency(layout.prime, "scaling_max_freq");
+        const long primeMax = ReadCpuFrequency(layout.prime, "cpuinfo_max_freq");
+        const long referenceLimit = ReadCpuFrequency(layout.reference, "scaling_max_freq");
+        const long referenceMax = ReadCpuFrequency(layout.reference, "cpuinfo_max_freq");
+        if (primeLimit <= 0 || primeMax <= 0 || referenceLimit <= 0 || referenceMax <= 0)
+            return s_throttled = false;
+        const double prime = double(layout.primeCapacity) * double(primeLimit) / double(primeMax);
+        const double reference = double(layout.referenceCapacity) * double(referenceLimit) / double(referenceMax);
+        s_throttled = prime < reference * (s_throttled ? 0.90 : 0.80);
+        return s_throttled;
+    }
+
     // Main-thread placement with the paused-core fallback, every 100 ms. Returns the mask the
     // thread got, for the threads that follow it (Role::PrimeShared). In layout mode D the thread
     // placed here is the recorder.
@@ -420,7 +492,7 @@ namespace
     {
         const Layout& layout = GetLayout();
         using clock = std::chrono::steady_clock;
-        enum State { Prime, BigPaused, BigCpuset };
+        enum State { Prime, BigPaused, BigCpuset, BigThrottled };
         static int s_state = -1;
         static int s_strays;
         static clock::time_point s_retry;
@@ -437,6 +509,8 @@ namespace
         int next = Prime;
         if ((s_state == BigPaused || s_state == BigCpuset) && now < s_retry)
             next = s_state;
+        else if (PrimeThrottled(now))
+            next = BigThrottled;
         else if (sched_setaffinity(tid, sizeof(cpu_set_t), &layout.primeOnly) != 0)
             next = BigCpuset;
         else if (s_state == Prime && ran && cpu != layout.prime)
@@ -450,6 +524,12 @@ namespace
             s_retry = now + std::chrono::seconds(2);
             sched_setaffinity(tid, sizeof(cpu_set_t), &layout.allBig);
         }
+        // Every call: the system resets the mask every few seconds (see the top of the file).
+        if (next == BigThrottled)
+        {
+            s_strays = 0;
+            sched_setaffinity(tid, sizeof(cpu_set_t), &layout.allBig);
+        }
 
         // core_ctl pauses the fastest core on and off, so the paused fallback is reported as a
         // count every 30 seconds instead of at every switch.
@@ -457,7 +537,13 @@ namespace
         static clock::time_point s_nextReport = now + std::chrono::seconds(30);
         if (next != s_state)
         {
-            if (next == BigPaused && s_state != -1)
+            if (next == BigThrottled)
+                LOGN("affinity: fastest core limited below the other big cores (heat); main thread on the big cluster");
+            else if (s_state == BigThrottled)
+                LOGN("affinity: fastest core no longer limited; main thread back on it");
+            if (next == BigThrottled || (s_state == BigThrottled && next == Prime))
+                ;
+            else if (next == BigPaused && s_state != -1)
                 s_pauses++;
             else if (next == BigCpuset || s_state == -1)
                 LOGFN("affinity: main thread on the {}", next == BigCpuset ? "big cluster (outside the cpuset)" : "fastest core");

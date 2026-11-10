@@ -245,6 +245,7 @@ public class MainActivity extends Activity {
         if (activities != null) {
             activities.getMemoryInfo(memory);
         }
+        installBundledDrivers();
         nativeLauncherStart(getAssets(), files.getAbsolutePath(), getFilesDir().getAbsolutePath(),
                 getApplicationInfo().nativeLibraryDir, version,
                 android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL,
@@ -393,6 +394,87 @@ public class MainActivity extends Activity {
                 importDriver(uri);
             }
         }, "DriverImport").start();
+    }
+
+    // The drivers the APK carries as AdrenoTools packages (assets/drivers/<id>.zip, tools/build-apk.sh):
+    // each goes to files/drivers/<id>/ like an imported one, with a ".bundled" file holding the
+    // package's size so that an update with another package replaces it. Only on an Adreno phone
+    // (Qualcomm's kernel driver, /dev/kgsl-3d0): nothing else can load them. Before the launcher
+    // starts, which lists that folder.
+    private void installBundledDrivers() {
+        if (!new File("/dev/kgsl-3d0").exists()) {
+            return;
+        }
+        File drivers = new File(getFilesDir(), "drivers");
+        String[] packages;
+        try {
+            packages = getAssets().list("drivers");
+        } catch (IOException e) {
+            return;
+        }
+        if (packages == null) {
+            return;
+        }
+        for (String asset : packages) {
+            if (!asset.endsWith(".zip")) {
+                continue;
+            }
+            String id = asset.substring(0, asset.length() - 4);
+            File target = new File(drivers, id);
+            File marker = new File(target, ".bundled");
+            File temp = new File(drivers, ".bundled-" + id);
+            try {
+                String stamp;
+                try (android.content.res.AssetFileDescriptor descriptor = getAssets().openFd("drivers/" + asset)) {
+                    stamp = String.valueOf(descriptor.getLength());
+                }
+                if (marker.isFile() && stamp.equals(new String(
+                        java.nio.file.Files.readAllBytes(marker.toPath()), "UTF-8"))) {
+                    continue;
+                }
+                deleteTree(temp);
+                if (!temp.mkdirs()) {
+                    throw new IOException("folder");
+                }
+                String base = temp.getCanonicalPath() + File.separator;
+                byte[] buffer = new byte[1 << 16];
+                try (InputStream input = getAssets().open("drivers/" + asset);
+                        ZipInputStream zip = new ZipInputStream(input)) {
+                    ZipEntry entry;
+                    while ((entry = zip.getNextEntry()) != null) {
+                        File out = new File(temp, entry.getName());
+                        if (!out.getCanonicalPath().startsWith(base)) {
+                            throw new IOException("path");
+                        }
+                        if (entry.isDirectory()) {
+                            out.mkdirs();
+                            continue;
+                        }
+                        out.getParentFile().mkdirs();
+                        try (OutputStream output = new java.io.FileOutputStream(out)) {
+                            int read;
+                            while ((read = zip.read(buffer)) > 0) {
+                                output.write(buffer, 0, read);
+                            }
+                        }
+                    }
+                }
+                if (!new File(temp, "meta.json").isFile()) {
+                    throw new IOException("meta");
+                }
+                try (OutputStream output = new java.io.FileOutputStream(new File(temp, ".bundled"))) {
+                    output.write(stamp.getBytes("UTF-8"));
+                }
+                deleteTree(target);
+                if (!temp.renameTo(target)) {
+                    throw new IOException("move");
+                }
+                android.util.Log.i("xport", "bundled driver unpacked: " + target);
+            } catch (Exception e) {
+                deleteTree(temp);
+                android.util.Log.w("xport", "bundled driver " + asset + " not unpacked: " + e);
+            }
+        }
     }
 
     // Unpacks a driver .zip (an AdrenoTools package: meta.json and the .so it names) into
