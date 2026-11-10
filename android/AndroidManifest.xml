@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the app shell, one APK for every GPU: the launcher (libgame.so, runtime/os/launcher.h)
+     tells Mali from Adreno and starts the game. Built without Gradle by tools/build-apk.sh. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.xport"
+    android:versionCode="10001"
+    android:versionName="1.0.1">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+
+    <application
+        android:label="LibertyDroid"
+        android:icon="@mipmap/ic_launcher"
+        android:appCategory="game"
+        android:isGame="true"
+        android:debuggable="true"
+        android:extractNativeLibs="true"
+        android:hasCode="true">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

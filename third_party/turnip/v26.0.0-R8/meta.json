@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "name": "Mesa Turnip driver v26.0.0 - R8",
+  "description": "Compiled from Source + unsupported gpu hacks",
+  "author": "KIMCHI",
+  "packageVersion": "1",
+  "vendor": "Mesa",
+  "driverVersion": "Vulkan 1.4.335",
+  "minApi": 27,
+  "libraryName": "vulkan.ad07xx.so"
+}

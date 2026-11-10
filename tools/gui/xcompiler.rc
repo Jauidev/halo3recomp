@@ -1,0 +1,4 @@
+// The window's and the exe's icon (xcompiler.ico, from the logo xcompiler.png), and the logo's X
+// that the window's header draws (xcompiler-mark.png).
+1 ICON "xcompiler.ico"
+2 RCDATA "xcompiler-mark.png"

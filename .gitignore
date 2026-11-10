@@ -1,0 +1,7 @@
+/build/
+/work/
+__pycache__/
+*.pyc
+/games/*/ppc/
+/games/*/dlls/
+/games/*/data/shader/

@@ -1,0 +1,14 @@
+#pragma once
+
+// stands in for ReXGlue's CMake-generated version header.
+#define REXGLUE_VERSION_MAJOR 0
+#define REXGLUE_VERSION_MINOR 7
+#define REXGLUE_VERSION_PATCH 5
+#define REXGLUE_VERSION_TWEAK 0
+#define REXGLUE_VERSION_STRING "0.7.5-xport"
+#define REXGLUE_VERSION_NUMERIC "0.7.5.0"
+#define REXGLUE_VERSION_FLOOR "0.7.5"
+#define REXGLUE_BUILD_PLATFORM "xport"
+#define REXGLUE_BUILD_TIMESTAMP ""
+#define REXGLUE_BUILD_TITLE "[rexglue-v" REXGLUE_VERSION_STRING "-" REXGLUE_BUILD_CONFIG "]"
+#define REXGLUE_BUILD_STAMP "build: rexglue-v" REXGLUE_VERSION_STRING
