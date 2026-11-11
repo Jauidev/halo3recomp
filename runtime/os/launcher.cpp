@@ -31,16 +31,17 @@ namespace
 
     struct Event
     {
-        enum Type { Touch, Key, Gamepad, DriverImported, IsoPicked, Insets } type;
+        enum Type { Touch, Key, Gamepad, DriverImported, IsoPicked, Insets, Patches } type;
         int action = 0; // Touch: 0 down, 1 move, 2 up, 3 cancel. Key: the Key code. IsoPicked: the fd.
         float x = 0, y = 0, right = 0, bottom = 0; // Touch: x, y. Insets: x left, y top.
-        bool flag = false; // Key: pressed. DriverImported: succeeded.
+        bool flag = false; // Key: pressed. DriverImported, Patches: succeeded.
         std::string text;
     };
 
     JavaVM* g_vm;
     jclass g_activity;
     jmethodID g_playMethod, g_exitMethod, g_pickMethod, g_pickIsoMethod, g_restartMethod;
+    jmethodID g_pickPatchMethod, g_patchActionMethod;
 #if XPORT_TITLE_ID == 0x4D5308AB || XPORT_TITLE_ID == 0x4D5307E6
     jmethodID g_copyMethod;
 #endif
@@ -381,6 +382,9 @@ namespace
         case Event::Insets:
             UiInsets(event.x, event.y, event.right, event.bottom);
             break;
+        case Event::Patches:
+            UiPatchesChanged(event.text, event.flag);
+            break;
         }
     }
 
@@ -635,6 +639,25 @@ void RequestRestart()
         CallJava(env, g_restartMethod, nullptr);
 }
 
+void RequestPatchImport()
+{
+    JNIEnv* env = nullptr;
+    if (g_vm && g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK)
+        CallJava(env, g_pickPatchMethod, nullptr);
+}
+
+void RequestPatchAction(const std::string& action)
+{
+    JNIEnv* env = nullptr;
+    if (g_vm && g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK)
+        CallJava(env, g_patchActionMethod, &action);
+}
+
+bool PatchesAvailable()
+{
+    return g_pickPatchMethod && g_patchActionMethod;
+}
+
 #if XPORT_TITLE_ID == 0x4D5308AB || XPORT_TITLE_ID == 0x4D5307E6
 void RequestCopyText(const std::string& text)
 {
@@ -682,6 +705,19 @@ extern "C" JNIEXPORT void JNICALL Java_com_xport_MainActivity_nativeLauncherStar
     g_restartMethod = env->GetStaticMethodID(activity, "launcherRestart", "()V");
     if (env->ExceptionCheck())
         env->ExceptionClear();
+    // Parches (Patches.java): absent from an APK made before them, then the page says so.
+    g_pickPatchMethod = env->GetStaticMethodID(activity, "launcherPickPatch", "()V");
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        g_pickPatchMethod = nullptr;
+    }
+    g_patchActionMethod = env->GetStaticMethodID(activity, "launcherPatchAction", "(Ljava/lang/String;)V");
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        g_patchActionMethod = nullptr;
+    }
 #if XPORT_TITLE_ID == 0x4D5308AB || XPORT_TITLE_ID == 0x4D5307E6
     g_copyMethod = env->GetStaticMethodID(activity, "launcherCopyText", "(Ljava/lang/String;)V");
     if (env->ExceptionCheck())
@@ -756,6 +792,16 @@ extern "C" JNIEXPORT void JNICALL Java_com_xport_MainActivity_nativeLauncherDriv
     jstring message, jboolean ok)
 {
     Event event{Event::DriverImported};
+    event.text = JavaString(env, message);
+    event.flag = ok;
+    Post(std::move(event));
+}
+
+// Parches: Patches.java's answer to Importar parche or to an action ("<what>\t<name or code>").
+extern "C" JNIEXPORT void JNICALL Java_com_xport_MainActivity_nativeLauncherPatches(JNIEnv* env, jclass,
+    jstring message, jboolean ok)
+{
+    Event event{Event::Patches};
     event.text = JavaString(env, message);
     event.flag = ok;
     Post(std::move(event));

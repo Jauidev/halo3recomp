@@ -25,9 +25,13 @@ Sigue a [Gears3Recomp](https://github.com/Jauidev/Gears3Recomp), el port de Gear
 - Las pipelines que el port ya conoce se preparan al arrancar, y las nuevas se compilan en los núcleos de
   eficiencia sin quitarle tiempo al juego; aun así, la primera vez que se entra en una zona pueden bajar los
   fps o tardar en aparecer algún objeto.
-- Launcher propio, con su fondo y sus colores. En **GPU y drivers** (móviles Adreno) se elige el driver
-  Vulkan: el del sistema, uno de los Mesa Turnip incluidos (27.0.0-R2, 27.0.0-R2 para One UI, Gen8 V39 y
-  26.0.0 R8) o uno importado en `.zip`.
+- Launcher propio, con su fondo y sus colores. En **GPU y drivers** se elige el driver Vulkan: en Adreno,
+  el del sistema, uno de los Mesa Turnip incluidos (27.0.0-R2, 27.0.0-R2 para One UI, Gen8 V39 y
+  26.0.0 R8) o uno importado en `.zip`; en Mali, el del sistema o uno de los PanVK incluidos
+  (experimentales, ver `third_party/panvk/`) o importados en `.zip` o `.so`.
+- **Parches**: los arreglos se instalan desde un `.zip` en el launcher, sin reinstalar la APK. Los parches
+  oficiales van firmados (`tools/make-patch.py`); si un parche impide arrancar el juego dos veces seguidas,
+  se desactiva solo.
 - Probado solo en parte de la campaña y solo en una GPU Mali (Mali-G615). En Adreno no se ha probado.
 - Hace falta un móvil potente: en uno de 4 GB de RAM con Adreno 610 no es jugable.
 
@@ -88,6 +92,7 @@ conserva su propia licencia. La licencia cubre el código de este repositorio, n
 Port Android: **Jauidev**.
 
 Liberty Recompiled (renderer nativo xnative), ReXGlue SDK, XenonRecomp, XenosRecomp y Unleashed Recompiled
-(hedge-dev), Xenia Canary, DirectX Shader Compiler, glslang, smol-v, volk, SMAA, Mesa Turnip, libadrenotools,
+(hedge-dev), Xenia Canary, DirectX Shader Compiler, glslang, smol-v, volk, SMAA, Mesa Turnip, Mesa PanVK
+(builds de FristOneRR, LukeValen y panvk-kbase-android), libadrenotools,
 libGPUCounters, FFmpeg, libmspack, Zstandard, Snappy, xxHash, unordered_dense, O(1) Heap, spdlog, fmt,
 Dear ImGui, stb_image, Khronos Validation Layers y GFXReconstruct.

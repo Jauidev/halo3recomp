@@ -30,9 +30,16 @@ LABEL=$(sed -n 's/^set(XPORT_APP_LABEL "\(.*\)")/\1/p' "$ROOT/games/$GAME/game.c
 LABEL="${LABEL:-$GAME}"
 TURNIP="$ROOT/third_party/turnip/v27.0.0-R2/libvulkan_freedreno.so"
 # The other drivers go in the APK as their AdrenoTools .zip
-# (assets/drivers/<id>.zip); MainActivity unpacks them into files/drivers/<id>/ on an Adreno phone,
-# where the launcher lists them beside the imported ones.
+# (assets/drivers/<id>.zip); MainActivity unpacks them into files/drivers/<id>/, the turnip-* ones
+# on an Adreno phone and the panvk-* ones (Mesa PanVK on Mali's kbase kernel driver, 2026-11-11)
+# on a Mali one, where the launcher lists them beside the imported ones.
 BUNDLED_DRIVERS="turnip-gen8-v39=$ROOT/third_party/turnip/gen8-v39/Turnip_Gen8_V39_Patched.zip;turnip-v26.0.0-r8=$ROOT/third_party/turnip/v26.0.0-R8/Turnip_v26.0.0_R8.zip;turnip-v27.0.0-r2-oneui=$ROOT/third_party/turnip/v27.0.0-R2-oneui/Turnip_v27.0.0-R2-SAMSUNG.zip"
+BUNDLED_DRIVERS="$BUNDLED_DRIVERS;panvk-fristonerr-v3.7.0=$ROOT/third_party/panvk/fristonerr-v3.7.0/PanVK-FristOneRR-V.3.7.0.zip"
+BUNDLED_DRIVERS="$BUNDLED_DRIVERS;panvk-g925-v13-0.0.1=$ROOT/third_party/panvk/g925-v13-csf-0.0.1/PanVK-Kbase-Android-g925-v13-csf-v0.0.1-bc-mip-priority-20261029-e2d83eff.adpkg.zip"
+BUNDLED_DRIVERS="$BUNDLED_DRIVERS;panvk-strato-safety-v4=$ROOT/third_party/panvk/strato-safety-v4/PanVK-Strato-Mali-SAFETY-v4.zip"
+for item in ${BUNDLED_DRIVERS//;/ }; do
+    [ -f "${item#*=}" ] || { echo "missing bundled driver: ${item#*=}" >&2; exit 1; }
+done
 HOOKS="$BUILD/third_party/libadrenotools/src/hook"
 
 rm -rf "$OUT"
@@ -107,10 +114,22 @@ UI_FONT="$ROOT/third_party/xenia-gpu/third_party/imgui/misc/fonts/Roboto-Medium.
 GAME_BG="$ROOT/games/$GAME/LAUNCHER/FONDO.png"
 [ -f "$GAME_BG" ] || GAME_BG=""
 
+# assets/build.txt, for the launcher's patches (android/src/com/xport/Patches.java, tools/make-patch.py):
+# this build's number (the date and time it was made: a patch's library must be newer to load), the
+# Java side's ABI (a patch's library loads only with the same), the game and its version name.
+PATCH_ABI=$(sed -n 's/.*static final int ABI = \([0-9][0-9]*\);.*/\1/p' "$ROOT/android/src/com/xport/Patches.java")
+[ -n "$PATCH_ABI" ] || { echo "Patches.java: no ABI" >&2; exit 1; }
+BUILD_INFO="build=$(date +%Y%m%d%H%M%S)
+abi=$PATCH_ABI
+game=$GAME
+version=$(sed -n 's/.*android:versionName="\([^"]*\)".*/\1/p' "$OUT/AndroidManifest.xml")
+"
+echo "build.txt: $(echo "$BUILD_INFO" | tr '\n' ' ')"
+
 # The libraries keep the source paths of __FILE__ (asserts, logs): the folder the project was built in
 # (and its parent) becomes a relative path of the same length ("././.../third_party/..."), so an APK
 # does not carry the builder's folders.
-BUNDLED_DRIVERS="$BUNDLED_DRIVERS" py -3 - "$ROOT" "$OUT" "$LAUNCHER" "$UI_FONT" "$GAME_BG" "${LAYERS[@]}" <<'EOF'
+BUILD_INFO="$BUILD_INFO" BUNDLED_DRIVERS="$BUNDLED_DRIVERS" py -3 - "$ROOT" "$OUT" "$LAUNCHER" "$UI_FONT" "$GAME_BG" "${LAYERS[@]}" <<'EOF'
 import sys, zipfile, os, re
 root, out, launcher, ui_font, game_bg, layers = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 
@@ -149,6 +168,7 @@ with zipfile.ZipFile(os.path.join(out, "base.apk"), "a", zipfile.ZIP_DEFLATED) a
         name, _, path = item.partition("=")
         if name and os.path.isfile(path):
             apk.write(path, "assets/drivers/" + name + ".zip", zipfile.ZIP_STORED)
+    apk.writestr("assets/build.txt", os.environ["BUILD_INFO"])
 EOF
 
 "$BT/zipalign.exe" -f -p 4 "$OUT/base.apk" "$OUT/aligned.apk"

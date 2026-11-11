@@ -442,7 +442,8 @@ REXCVAR_DEFINE_BOOL(xnative_nan_safe_minmax, false, "Xcompiler/Graphics/Native R
                     "result each GPU picks); applies when shaders load");
 REXCVAR_DEFINE_UINT32(xnative_memexport_compute, 0, "Xcompiler/Graphics/Native Renderer",
                       "Memory-export vertex shaders (Halo 3's particles) run as compute shaders: "
-                      "0 = when the GPU lacks vertexPipelineStoresAndAtomics (Mali), 1 = always, "
+                      "0 = when the GPU lacks vertexPipelineStoresAndAtomics (Mali) or is an "
+                      "Adreno, 1 = always, "
                       "2 = never")
     .range(0, 2);
 REXCVAR_DEFINE_UINT32(xnative_memexport_batch, 1, "Xcompiler/Graphics/Native Renderer",
@@ -8887,6 +8888,69 @@ VkFormat NativeGraphicsSystem::GetDefaultVertexFormat(NativeVertexNumericType nu
   return VK_FORMAT_UNDEFINED;
 }
 
+namespace {
+// Xcompiler: the launcher's shader patches (MainActivity's Patches.java). XPORT_PATCH_SHADERS
+// lists folders (':'-separated, a later one wins) with <HASH16>.vs.spv / <HASH16>.ps.spv and, for a
+// pixel shader whose cache entry has a late-Z variant, <HASH16>.ps.late.spv too: plain SPIR-V used
+// instead of the cache's copy. The cache entry's metadata (texture, fetch and patch masks) stays.
+// Without the variable (no shader patch on), nothing is read.
+bool LoadPatchedShaderSpirv(uint64_t hash, bool pixel, bool has_late, std::vector<uint32_t>& early,
+                            std::vector<uint32_t>& late, std::string& source) {
+  static const std::vector<std::filesystem::path> folders = [] {
+    std::vector<std::filesystem::path> list;
+    const char* value = std::getenv("XPORT_PATCH_SHADERS");
+    std::string_view rest = value ? value : "";
+    while (!rest.empty()) {
+      const size_t colon = rest.find(':');
+      if (colon != 0) {
+        list.emplace_back(std::string(rest.substr(0, colon)));
+      }
+      rest = colon == std::string_view::npos ? std::string_view() : rest.substr(colon + 1);
+    }
+    return list;
+  }();
+  if (folders.empty()) {
+    return false;
+  }
+  const auto read = [](const std::filesystem::path& path, std::vector<uint32_t>& words) {
+    std::FILE* file = std::fopen(path.string().c_str(), "rb");
+    if (!file) {
+      return false;
+    }
+    std::fseek(file, 0, SEEK_END);
+    const long size = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    bool ok = size >= 20 && size % 4 == 0 && size < (64l << 20);
+    if (ok) {
+      words.resize(size_t(size) / sizeof(uint32_t));
+      ok = std::fread(words.data(), 1, size_t(size), file) == size_t(size) && words[0] == kSpirvMagic;
+    }
+    std::fclose(file);
+    return ok;
+  };
+  const std::string name = fmt::format("{:016X}.{}", hash, pixel ? "ps" : "vs");
+  for (auto it = folders.rbegin(); it != folders.rend(); ++it) {
+    std::vector<uint32_t> patched_early;
+    std::vector<uint32_t> patched_late;
+    if (!read(*it / (name + ".spv"), patched_early)) {
+      continue;
+    }
+    if (has_late && !read(*it / (name + ".late.spv"), patched_late)) {
+      REXLOG_ERROR("xnative: patch shader {} in {} has no late variant; the cache's is used", name,
+                   it->string());
+      continue;
+    }
+    early = std::move(patched_early);
+    if (has_late) {
+      late = std::move(patched_late);
+    }
+    source = it->string();
+    return true;
+  }
+  return false;
+}
+}  // namespace
+
 void NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& command) {
   static_assert(uint32_t(ShaderStage::kPixel) == kShaderOverrideStagePixel);
   static_assert(uint32_t(ShaderStage::kVertex) == kShaderOverrideStageVertex);
@@ -8994,6 +9058,18 @@ void NativeGraphicsSystem::RegisterShader(const RegisterShaderCommand& command) 
         !decode_cached_spirv(cache_entry->lateSpirvOffset, cache_entry->lateSpirvSize, "late",
                              stock_late_spirv, stock_late_spirv_size)) {
       return;
+    }
+    // A launcher patch's copy of this shader, when one is on (LoadPatchedShaderSpirv).
+    if (std::string patch_source;
+        LoadPatchedShaderSpirv(command.hash, command.stage == ShaderStage::kPixel,
+                               !stock_late_spirv.empty(), stock_early_spirv, stock_late_spirv,
+                               patch_source)) {
+      stock_early_spirv_size = stock_early_spirv.size() * sizeof(uint32_t);
+      if (!stock_late_spirv.empty()) {
+        stock_late_spirv_size = stock_late_spirv.size() * sizeof(uint32_t);
+      }
+      REXLOG_INFO("xnative: {} shader {:016X} from the patch in {}", stage_name, command.hash,
+                  patch_source);
     }
     if (stock_early_spirv.empty() || stock_early_spirv.front() != kSpirvMagic) {
       REXLOG_ERROR("xnative: invalid stock early SPIR-V module for shader {}",
@@ -13650,7 +13726,20 @@ bool NativeGraphicsSystem::CreateMemExportComputeObjects() {
   const ui::vulkan::VulkanDevice* vulkan_device = vulkan_provider->vulkan_device();
   const uint32_t mode = REXCVAR_GET(xnative_memexport_compute);
   const bool stores = vulkan_device->properties().vertexPipelineStoresAndAtomics;
-  if (mode == 2 || (mode == 0 && stores)) {
+  // Xcompiler (Halo 3, 2026-11-11, Adreno only): a Qualcomm GPU (vendor 0x5143, its own driver or
+  // Turnip) has vertex shader stores, but the automatic mode takes compute there too. The Adreno
+  // Offline Compiler (A740) gave the particle update 0DE4C49E 28664 instructions as a vertex shader,
+  // 36 registers, 20 bytes of scratch and 25 % occupancy, ~90 draws a frame, each one draw and
+  // repeated by the binning pass, which may also run the stores twice; as compute (same module the
+  // Mali uses) the draws of a run share one dispatch and there is no binning pass. Checked on the
+  // Redmi Note 11 (Adreno 610, Turnip, 2026-11-11): the 8 memory-export shaders ran as compute and
+  // the mist looked right, fps unchanged there (3.5, bound elsewhere). The Mali has no vertex
+  // shader stores and already took compute: nothing changes for it.
+  VkPhysicalDeviceProperties device_properties{};
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+      vulkan_device->physical_device(), &device_properties);
+  const bool adreno = device_properties.vendorID == 0x5143;
+  if (mode == 2 || (mode == 0 && stores && !adreno)) {
     REXLOG_INFO("xnative-memexport: vertex shader stores {} (compute path off)",
                 stores ? "supported" : "unsupported");
     return false;
@@ -13678,7 +13767,7 @@ bool NativeGraphicsSystem::CreateMemExportComputeObjects() {
   }
   memexport_compute_enabled_ = true;
   REXLOG_INFO("xnative-memexport: vertex shader stores {}: memory export runs as compute",
-              stores ? "supported (forced)" : "unsupported");
+              !stores ? "unsupported" : (mode == 1 ? "supported (forced)" : "supported (Adreno)"));
   return true;
 }
 

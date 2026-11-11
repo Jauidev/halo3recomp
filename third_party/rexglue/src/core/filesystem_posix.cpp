@@ -11,6 +11,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <iostream>
@@ -56,7 +57,12 @@ std::filesystem::path GetExecutablePath() {
 #if defined(__ANDROID__)
   // /proc/self/exe is app_process. The runtime and its GPU plugins are shared
   // libraries unpacked side by side into nativeLibraryDir, so report the
-  // library holding this code instead.
+  // library holding this code instead. Xcompiler: a launcher patch's
+  // libgame.so runs from the app's files; MainActivity names the APK's library
+  // folder in XPORT_NATIVE_LIB_DIR, where the other libraries are.
+  if (const char* dir = getenv("XPORT_NATIVE_LIB_DIR"); dir && *dir) {
+    return std::filesystem::path(dir) / "libgame.so";
+  }
   Dl_info info{};
   if (dladdr(reinterpret_cast<const void*>(&GetExecutablePath), &info) && info.dli_fname) {
     return info.dli_fname;

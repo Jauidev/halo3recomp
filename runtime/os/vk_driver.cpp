@@ -8,7 +8,8 @@
 // instead of loading libvulkan.so (ui/vulkan/vulkan_instance.cpp).
 // The choice, logged as "vk-driver: ...":
 // - no Qualcomm kernel driver (KGSL, /dev/kgsl-3d0; Mali has /dev/mali0): the phone's own driver,
-//   since Turnip would find no GPU;
+//   since Turnip would find no GPU, or an imported one when files/vk_driver says "custom" (Mesa
+//   PanVK built for Mali's kbase kernel driver, 2026-11-11);
 // - files/vk_driver (written by the launcher's GPU y drivers page): "system" (or 0) the phone's
 //   driver, "turnip" (or 1) Turnip, "custom" followed by a line with the driver's folder and one
 //   with its library an imported driver (files/drivers/<name>/ in the app's internal storage);
@@ -129,22 +130,80 @@ namespace
         else if (!strstr(tuDebug, "noconform"))
             setenv("TU_DEBUG", (std::string(tuDebug) + ",noconform").c_str(), 1);
     }
+
+    // The app's native library folder (getApplicationInfo().nativeLibraryDir), where the package
+    // manager extracted libgame.so, Turnip and the hooks (extractNativeLibs="true"). MainActivity
+    // names it in XPORT_NATIVE_LIB_DIR: a patch's libgame.so (Patches.java) runs from another
+    // folder, without Turnip and the hooks beside it.
+    std::string NativeLibraryDir()
+    {
+        if (const char* dir = getenv("XPORT_NATIVE_LIB_DIR"); dir && *dir)
+            return std::string(dir) + "/";
+        Dl_info info{};
+        if (!dladdr(reinterpret_cast<void*>(&NativeLibraryDir), &info) || !info.dli_fname)
+            return {};
+        std::string dir = info.dli_fname;
+        dir.erase(dir.rfind('/') + 1);
+        return dir;
+    }
+
+    // An imported driver (files/vk_driver = custom) through adrenotools, or nullptr. Its hook sends
+    // libvulkan's load of the vendor's HAL (any .../hw/vulkan.<board>.so: Adreno's or Mali's) to the
+    // imported library; only its optional KGSL features are Qualcomm's.
+    void* OpenImportedDriver(const Forced& forced, const std::string& libraryDir, bool adreno, const char* fallback)
+    {
+        const std::string path = forced.dir + forced.library;
+        if (access(path.c_str(), R_OK) != 0)
+        {
+            LOGFN_WARNING("vk-driver: imported driver {} is missing; {} instead", path, fallback);
+            return nullptr;
+        }
+        if (const char* problem = DriverProblem(path))
+        {
+            LOGFN_WARNING("vk-driver: imported driver {} can't run, {}; {} instead", path, problem, fallback);
+            return nullptr;
+        }
+        if (adreno)
+        {
+            NoConformance();
+        }
+        else if (!getenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER"))
+        {
+            // Upstream PanVK refuses a Mali generation it has not passed conformance on without it
+            // (the Mali-G615 is arch v11), as Turnip needs noconform on the Adreno 610.
+            setenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 1);
+        }
+        void* loader = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
+            libraryDir.c_str(), forced.dir.c_str(), forced.library.c_str(), nullptr, nullptr);
+        if (loader)
+            LOGFN("vk-driver: imported driver {} through adrenotools", path);
+        else
+            LOGFN_WARNING("vk-driver: adrenotools could not open {}; {} instead", path, fallback);
+        return loader;
+    }
 }
 
 extern "C" void* xport_open_vulkan_loader()
 {
     if (access("/dev/kgsl-3d0", F_OK) != 0)
     {
-        LOGN("vk-driver: no Adreno GPU (/dev/kgsl-3d0), the phone's own Vulkan driver");
-        return nullptr;
+        // Mali (and any other GPU): the phone's driver, unless the launcher's GPU y drivers page
+        // chose an imported one (Mesa PanVK built for Mali's kernel driver, kbase), which it names
+        // in files/vk_driver ("custom"). Without that file this is the path it always was.
+        const Forced forced = ForcedDriver();
+        if (forced.driver != 'c')
+        {
+            LOGN("vk-driver: no Adreno GPU (/dev/kgsl-3d0), the phone's own Vulkan driver");
+            return nullptr;
+        }
+        const std::string libraryDir = NativeLibraryDir();
+        if (libraryDir.empty())
+            return nullptr;
+        return OpenImportedDriver(forced, libraryDir, false, "the phone's own Vulkan driver");
     }
-    // The app's native library folder (getApplicationInfo().nativeLibraryDir), where the package
-    // manager extracted libgame.so, Turnip and the hooks (extractNativeLibs="true").
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(&xport_open_vulkan_loader), &info) || !info.dli_fname)
+    const std::string libraryDir = NativeLibraryDir();
+    if (libraryDir.empty())
         return nullptr;
-    std::string libraryDir = info.dli_fname;
-    libraryDir.erase(libraryDir.rfind('/') + 1);
     const Forced forced = ForcedDriver();
     if (forced.driver == 's')
     {
@@ -153,27 +212,8 @@ extern "C" void* xport_open_vulkan_loader()
     }
     if (forced.driver == 'c')
     {
-        const std::string path = forced.dir + forced.library;
-        if (access(path.c_str(), R_OK) != 0)
-        {
-            LOGFN_WARNING("vk-driver: imported driver {} is missing; automatic choice instead", path);
-        }
-        else if (const char* problem = DriverProblem(path))
-        {
-            LOGFN_WARNING("vk-driver: imported driver {} can't run, {}; automatic choice instead", path, problem);
-        }
-        else
-        {
-            NoConformance();
-            void* loader = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr,
-                libraryDir.c_str(), forced.dir.c_str(), forced.library.c_str(), nullptr, nullptr);
-            if (loader)
-            {
-                LOGFN("vk-driver: imported driver {} through adrenotools", path);
-                return loader;
-            }
-            LOGFN_WARNING("vk-driver: adrenotools could not open {}; automatic choice instead", path);
-        }
+        if (void* loader = OpenImportedDriver(forced, libraryDir, true, "automatic choice"))
+            return loader;
     }
     if (access((libraryDir + TURNIP).c_str(), R_OK) != 0)
     {

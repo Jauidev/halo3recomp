@@ -388,6 +388,12 @@ bool Initialize(uint8_t* guest_base, uint8_t* physical_base) {
   if (const char* list = getenv("XNATIVE_CVARS"); list && *list) {
     apply_options(list);
   }
+  // The renderer options of the launcher's patches (MainActivity's Patches.java,
+  // config/opciones.txt "cvar name=value"), after the app's own.
+  if (const char* list = getenv("XPORT_PATCH_CVARS"); list && *list) {
+    fprintf(stderr, "xnative: patch options %s\n", list);
+    apply_options(list);
+  }
   // XPORT_PROFILE_AT=<seconds>: start the native profile capture that many seconds after
   // launch (in the level, not the menu). Use with XNATIVE_DIAG=logging,native-profiler.
   if (const char* at = getenv("XPORT_PROFILE_AT"); at && *at) {

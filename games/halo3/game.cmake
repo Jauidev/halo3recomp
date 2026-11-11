@@ -6,7 +6,7 @@ set(XPORT_XEX_VERSION 0x00000005)
 # The app's name on the phone (tools/build-apk.sh).
 set(XPORT_APP_LABEL "Halo 3")
 # The version the phone and the launcher show (tools/build-apk.sh: the manifest's versionName).
-set(XPORT_APP_VERSION "1.0.0")
+set(XPORT_APP_VERSION "1.0.1")
 # The launcher's colours (0xRRGGBB), blue mixed with green, to go with its own
 # background, LAUNCHER/FONDO.png (an original abstract picture: navy to teal, aurora light, hexagons):
 # the accent (selection, buttons) is a turquoise green, the glass tint a deep ocean blue.

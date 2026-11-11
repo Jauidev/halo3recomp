@@ -12,6 +12,9 @@
 #include <os/thread_dump.h>
 #include <os/thread_policy.h>
 #include "loader.h"
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#endif
 
 void InstallCrashHandler();
 
@@ -56,6 +59,11 @@ int XportMain()
 
     const auto xexPath = os::paths::GetGamePath() / "default.xex";
     LOGFN("game data: {}", os::paths::GetGamePath().string());
+#ifdef __ANDROID__
+    // The APK's libgame.so (nativeLibraryDir) or a patch's (files/patches/<id>/lib, Patches.java).
+    if (Dl_info self{}; dladdr(reinterpret_cast<void*>(&XportMain), &self) && self.dli_fname)
+        LOGFN("code: {}", self.dli_fname);
+#endif
 
     KiSystemStartup();
     StartThreadDumpWatchdog();

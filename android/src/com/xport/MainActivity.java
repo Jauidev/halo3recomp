@@ -41,9 +41,46 @@ import java.util.zip.ZipInputStream;
 // the files/ switches as they are.
 public class MainActivity extends Activity {
     // The game's library: the runtime and the code recompiled from the game's executable (one game
-    // per APK, tools/build-apk.sh).
+    // per APK, tools/build-apk.sh), or the one of a patch turned on in the launcher's Parches
+    // (Patches.java), which falls back to the APK's if it does not load. The library finds the
+    // APK's other libraries (Turnip, adrenotools' hooks) through XPORT_NATIVE_LIB_DIR, as a
+    // patch's library is not in their folder.
+    private static boolean libraryLoaded;
+
     private void loadGameLibrary() {
-        System.loadLibrary("game");
+        // Once per process: the activity made again keeps the library it has.
+        if (libraryLoaded) {
+            return;
+        }
+        libraryLoaded = true;
+        try {
+            android.system.Os.setenv("XPORT_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);
+        } catch (android.system.ErrnoException e) {
+            android.util.Log.w("xport", "XPORT_NATIVE_LIB_DIR not set: " + e);
+        }
+        String patched = Patches.startup(this, versionName());
+        boolean loaded = false;
+        if (patched != null) {
+            try {
+                System.load(patched);
+                loaded = true;
+            } catch (Throwable e) {
+                Patches.loadFailed(e);
+            }
+        }
+        if (!loaded) {
+            System.loadLibrary("game");
+        }
+        Patches.writeList();
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            android.util.Log.w("xport", "no version name: " + e);
+            return "";
+        }
     }
 
     private static native void nativeStart(String gameDir, String saveDir, String options);
@@ -66,11 +103,13 @@ public class MainActivity extends Activity {
     private static native void nativeLauncherInsets(int left, int top, int right, int bottom);
     private static native void nativeLauncherDriverImported(String message, boolean ok);
     private static native void nativeLauncherIsoPicked(int fd, String message);
+    // Parches: the answer to Importar parche or an action, "<what>\t<name or code>" (Patches.java).
+    private static native void nativeLauncherPatches(String message, boolean ok);
 
     // Keys the launcher understands (launcher.cpp's Key).
     private static final int KEY_UP = 1, KEY_DOWN = 2, KEY_LEFT = 3, KEY_RIGHT = 4, KEY_ACCEPT = 5,
             KEY_BACK = 6;
-    private static final int PICK_DRIVER = 1, PICK_ISO = 2;
+    private static final int PICK_DRIVER = 1, PICK_ISO = 2, PICK_PATCH = 3;
 
     // The activity the launcher's thread calls back into.
     private static MainActivity instance;
@@ -234,25 +273,39 @@ public class MainActivity extends Activity {
         root.requestApplyInsets();
 
         File files = getExternalFilesDir(null);
-        String version = "";
-        try {
-            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
-            android.util.Log.w("xport", "no version name: " + e);
-        }
+        // A patch's version while its library runs.
+        String version = Patches.shownVersion();
         android.app.ActivityManager.MemoryInfo memory = new android.app.ActivityManager.MemoryInfo();
         android.app.ActivityManager activities = getSystemService(android.app.ActivityManager.class);
         if (activities != null) {
             activities.getMemoryInfo(memory);
         }
-        installBundledDrivers();
         nativeLauncherStart(getAssets(), files.getAbsolutePath(), getFilesDir().getAbsolutePath(),
                 getApplicationInfo().nativeLibraryDir, version,
                 android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL,
                 java.util.Locale.getDefault().getLanguage(),
                 getResources().getDisplayMetrics().density, memory.availMem, memory.totalMem);
+        // Off the UI thread: the Mali packages are some 80 MB once unpacked. The launcher lists the
+        // drivers again when they are in place.
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                if (installBundledDrivers()) {
+                    nativeLauncherDriverImported("bundled", true);
+                }
+            }
+        }, "BundledDrivers").start();
         nativeLauncherGamepad(connectedGamepad());
+        // A patch library that has drawn the launcher for 5 s did not crash at its start.
+        handler.postDelayed(launcherShown, 5000);
     }
+
+    private final Runnable launcherShown = new Runnable() {
+        @Override
+        public void run() {
+            Patches.launcherShown();
+        }
+    };
 
     // Called by the launcher's thread once it has stopped drawing: Jugar with these options.
     static void launcherPlay(final String options) {
@@ -278,6 +331,7 @@ public class MainActivity extends Activity {
         activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                Patches.cleanExit();
                 activity.startActivity(android.content.Intent.makeRestartActivityTask(
                         new android.content.ComponentName(activity, MainActivity.class)));
                 Runtime.getRuntime().exit(0);
@@ -293,9 +347,48 @@ public class MainActivity extends Activity {
         activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                Patches.cleanExit();
                 activity.finish();
+                // A patch library turned on or off: the process ends, so the next start loads it.
+                if (Patches.restartNeeded()) {
+                    Runtime.getRuntime().exit(0);
+                }
             }
         });
+    }
+
+    // Parches' Importar parche: the system file picker for a patch .zip (tools/make-patch.py).
+    static void launcherPickPatch() {
+        final MainActivity activity = instance;
+        if (activity == null) {
+            return;
+        }
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/zip",
+                        "application/x-zip-compressed", "application/octet-stream"});
+                try {
+                    activity.startActivityForResult(intent, PICK_PATCH);
+                } catch (android.content.ActivityNotFoundException e) {
+                    nativeLauncherPatches("error\tpicker", false);
+                }
+            }
+        });
+    }
+
+    // Parches' Activar, Desactivar and Borrar: "on:<id>", "off:<id>", "del:<id>".
+    static void launcherPatchAction(final String action) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String result = Patches.action(action);
+                nativeLauncherPatches(result, !result.startsWith("error"));
+            }
+        }, "PatchAction").start();
     }
 
     // The launcher's Copiar in Último error (Gears of War 3 only): the text on the phone's clipboard.
@@ -373,9 +466,22 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
+            if (requestCode == PICK_PATCH) {
+                nativeLauncherPatches("cancel", false);
+            }
             return;
         }
         final Uri uri = data.getData();
+        if (requestCode == PICK_PATCH) {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    String result = Patches.importPatch(MainActivity.this, uri);
+                    nativeLauncherPatches(result, !result.startsWith("error"));
+                }
+            }, "PatchImport").start();
+            return;
+        }
         if (requestCode == PICK_ISO) {
             new Thread(new Runnable() {
                 @Override
@@ -398,28 +504,53 @@ public class MainActivity extends Activity {
 
     // The drivers the APK carries as AdrenoTools packages (assets/drivers/<id>.zip, tools/build-apk.sh):
     // each goes to files/drivers/<id>/ like an imported one, with a ".bundled" file holding the
-    // package's size so that an update with another package replaces it. Only on an Adreno phone
-    // (Qualcomm's kernel driver, /dev/kgsl-3d0): nothing else can load them. Before the launcher
-    // starts, which lists that folder.
-    private void installBundledDrivers() {
-        if (!new File("/dev/kgsl-3d0").exists()) {
-            return;
-        }
+    // package's size so that an update with another package replaces it. Each only where it can
+    // run: the turnip-* ones on an Adreno phone (Qualcomm's kernel driver, /dev/kgsl-3d0), the
+    // panvk-* ones on a Mali phone (Arm's kbase, /dev/mali0). A bundled one the APK no longer
+    // carries is removed: it has no Borrar. True when it changed that folder. One at a time: a
+    // second launcher start waits for the first.
+    private synchronized boolean installBundledDrivers() {
+        boolean changed = false;
+        boolean adreno = new File("/dev/kgsl-3d0").exists();
+        boolean mali = !adreno && new File("/dev/mali0").exists();
         File drivers = new File(getFilesDir(), "drivers");
         String[] packages;
         try {
             packages = getAssets().list("drivers");
         } catch (IOException e) {
-            return;
+            return false;
         }
         if (packages == null) {
-            return;
+            packages = new String[0];
+        }
+        java.util.Set<String> wanted = new java.util.HashSet<>();
+        for (String asset : packages) {
+            if (!asset.endsWith(".zip")) {
+                continue;
+            }
+            String id = asset.substring(0, asset.length() - 4);
+            if (id.startsWith("panvk-") ? mali : adreno) {
+                wanted.add(id);
+            }
+        }
+        File[] present = drivers.listFiles();
+        if (present != null) {
+            for (File folder : present) {
+                if (new File(folder, ".bundled").isFile() && !wanted.contains(folder.getName())) {
+                    deleteTree(folder);
+                    changed = true;
+                    android.util.Log.i("xport", "bundled driver removed: " + folder);
+                }
+            }
         }
         for (String asset : packages) {
             if (!asset.endsWith(".zip")) {
                 continue;
             }
             String id = asset.substring(0, asset.length() - 4);
+            if (!wanted.contains(id)) {
+                continue;
+            }
             File target = new File(drivers, id);
             File marker = new File(target, ".bundled");
             File temp = new File(drivers, ".bundled-" + id);
@@ -459,35 +590,50 @@ public class MainActivity extends Activity {
                         }
                     }
                 }
-                if (!new File(temp, "meta.json").isFile()) {
+                // meta.json at the top, or in the zip's only folder (PanVK-Strato-Mali-SAFETY-v4.zip).
+                File package_ = temp;
+                if (!new File(package_, "meta.json").isFile()) {
+                    File[] children = temp.listFiles();
+                    if (children != null && children.length == 1 && children[0].isDirectory()) {
+                        package_ = children[0];
+                    }
+                }
+                if (!new File(package_, "meta.json").isFile()) {
                     throw new IOException("meta");
                 }
-                try (OutputStream output = new java.io.FileOutputStream(new File(temp, ".bundled"))) {
+                try (OutputStream output = new java.io.FileOutputStream(new File(package_, ".bundled"))) {
                     output.write(stamp.getBytes("UTF-8"));
                 }
                 deleteTree(target);
-                if (!temp.renameTo(target)) {
+                if (!package_.renameTo(target)) {
                     throw new IOException("move");
                 }
+                deleteTree(temp);
+                changed = true;
                 android.util.Log.i("xport", "bundled driver unpacked: " + target);
             } catch (Exception e) {
                 deleteTree(temp);
                 android.util.Log.w("xport", "bundled driver " + asset + " not unpacked: " + e);
             }
         }
+        return changed;
     }
 
     // Unpacks a driver .zip (an AdrenoTools package: meta.json and the .so it names) into
     // files/drivers/<zip name>/ in the app's internal storage, the only place its code may be
-    // loaded from. Entries leaving the folder are refused. The launcher gets the driver's name, or
-    // the failure as a code (path, size, meta, library, folder, move) it shows in its language.
+    // loaded from. Entries leaving the folder are refused. A bare library (Mesa PanVK for Mali is
+    // also published as libvulkan_panfrost-android-aarch64.so) gets the meta.json of a package.
+    // The launcher gets the driver's name, or the failure as a code (path, size, meta, library,
+    // folder, move) it shows in its language.
     private void importDriver(Uri uri) {
         File drivers = new File(getFilesDir(), "drivers");
         File temp = new File(drivers, ".import");
         try {
-            String name = displayName(uri);
-            if (name.toLowerCase(java.util.Locale.ROOT).endsWith(".zip")) {
-                name = name.substring(0, name.length() - 4);
+            String file = displayName(uri);
+            String name = file;
+            String lower = name.toLowerCase(java.util.Locale.ROOT);
+            if (lower.endsWith(".zip") || lower.endsWith(".so")) {
+                name = name.substring(0, name.lastIndexOf('.'));
             }
             name = name.replaceAll("[^A-Za-z0-9._-]", "_");
             if (name.isEmpty() || name.startsWith(".")) {
@@ -500,8 +646,41 @@ public class MainActivity extends Activity {
             String base = temp.getCanonicalPath() + File.separator;
             long total = 0;
             byte[] buffer = new byte[1 << 16];
-            try (InputStream input = getContentResolver().openInputStream(uri);
+            try (InputStream raw = getContentResolver().openInputStream(uri);
+                    java.io.BufferedInputStream input = new java.io.BufferedInputStream(raw, 1 << 16);
                     ZipInputStream zip = new ZipInputStream(input)) {
+                input.mark(4);
+                byte[] magic = new byte[4];
+                int got = 0;
+                while (got < 4) {
+                    int read = input.read(magic, got, 4 - got);
+                    if (read < 0) {
+                        break;
+                    }
+                    got += read;
+                }
+                input.reset();
+                if (got == 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F') {
+                    String library = name + ".so";
+                    try (OutputStream output = new java.io.FileOutputStream(new File(temp, library))) {
+                        int read;
+                        while ((read = input.read(buffer)) > 0) {
+                            total += read;
+                            if (total > 512L << 20) {
+                                throw new IOException("size");
+                            }
+                            output.write(buffer, 0, read);
+                        }
+                    }
+                    org.json.JSONObject meta = new org.json.JSONObject();
+                    meta.put("schemaVersion", 1);
+                    meta.put("name", name);
+                    meta.put("description", "Imported as a library: " + file);
+                    meta.put("libraryName", library);
+                    try (OutputStream output = new java.io.FileOutputStream(new File(temp, "meta.json"))) {
+                        output.write(meta.toString(2).getBytes("UTF-8"));
+                    }
+                }
                 ZipEntry entry;
                 while ((entry = zip.getNextEntry()) != null) {
                     File out = new File(temp, entry.getName());
@@ -739,9 +918,15 @@ public class MainActivity extends Activity {
 
     // ---------- the game ----------
 
-    // Starts the game with the launcher's options followed by the intent's.
+    // Starts the game with the launcher's options, then the patches' (Patches.gameStarting, which
+    // also puts their shaders and renderer options in the environment), then the intent's.
     private void startGame(String launcherOptions) {
+        handler.removeCallbacks(launcherShown);
         String options = launcherOptions;
+        String patchOptions = Patches.gameStarting();
+        if (!patchOptions.isEmpty()) {
+            options = options.isEmpty() ? patchOptions : options + " " + patchOptions;
+        }
         if (intentOptions != null && !intentOptions.isEmpty()) {
             options = options.isEmpty() ? intentOptions : options + " " + intentOptions;
         }
@@ -801,6 +986,7 @@ public class MainActivity extends Activity {
         File game = new File(files, "game");
         if (!new File(game, "default.xex").exists()) {
             text.setText("Falta el disco del juego.\n\nCópialo con:\nadb shell cp -r /data/local/tmp/xport/game " + files.getAbsolutePath() + "/\n");
+            Patches.cleanExit();
             return;
         }
 
@@ -908,7 +1094,31 @@ public class MainActivity extends Activity {
             }
         }
         startCounters();
+        if (Patches.pending()) {
+            handler.postDelayed(patchCheck, 5000);
+        }
     }
+
+    // New patches are confirmed once the game has drawn frames in 4 checks 5 s apart (from then a
+    // crash no longer turns them off). The frame counter's rate when it shows (it reads the
+    // counter, which restarts at every read), else read here.
+    private float lastFrameRate;
+    private int patchGoodChecks;
+    private final Runnable patchCheck = new Runnable() {
+        @Override
+        public void run() {
+            float rate = lastFrameRate;
+            if (fpsMode == 0) {
+                float[] values = nativeFrameCounter();
+                rate = values != null && values.length == 2 ? values[0] : 0;
+            }
+            if (rate > 1 && ++patchGoodChecks >= 4) {
+                Patches.confirm();
+                return;
+            }
+            handler.postDelayed(this, 5000);
+        }
+    };
 
     // The status text and the frame counter refresh themselves while the activity is visible.
     private void startCounters() {
@@ -1024,6 +1234,7 @@ public class MainActivity extends Activity {
         public void run() {
             float[] values = nativeFrameCounter();
             if (values != null && values.length == 2) {
+                lastFrameRate = values[0];
                 showFrameCounter(values[0], values[1]);
             }
             handler.postDelayed(this, 500);
@@ -1105,6 +1316,8 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         handler.removeCallbacks(frameCounter);
         handler.removeCallbacks(refresh);
+        handler.removeCallbacks(patchCheck);
+        handler.removeCallbacks(launcherShown);
         if (inputManager != null) {
             inputManager.unregisterInputDeviceListener(inputListener);
         }

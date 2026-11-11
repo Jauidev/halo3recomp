@@ -16,6 +16,8 @@
 #include <unistd.h>
 #ifdef __ANDROID__
 #include <android/api-level.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #endif
 #include <ctime>
 #include <deque>
@@ -33,7 +35,7 @@ namespace
     enum Font { kSmall, kBody, kTitle, kHuge, kFontCount };
     constexpr float kFontDp[kFontCount] = {14, 18, 23, 38};
 
-    enum class Page { Home, Saves, Gpu, Controls, System, Credits, Crash, Games };
+    enum class Page { Home, Saves, Gpu, Controls, System, Credits, Crash, Games, Patches };
     enum class Icon
     {
         Play, Graphics, Saves, Gpu, Controls, System, Credits, Back, Chevron, Check, Cross, Lock, Pencil, Bell,
@@ -87,6 +89,7 @@ namespace
         {"volk", "Carga de Vulkan · Arseny Kapoulkine"},
         {"SMAA", "Antialiasing · Jorge Jimenez"},
         {"Mesa Turnip", "Driver Adreno · builds de KIMCHI y StevenMXZ"},
+        {"Mesa PanVK", "Driver Mali · builds de FristOneRR, LukeValen y panvk-kbase-android"},
         {"libadrenotools", "Carga de drivers · bylaws"},
         {"libGPUCounters", "Contadores de GPU · Arm"},
         {"FFmpeg", "Audio XMA · FFmpeg"},
@@ -159,7 +162,19 @@ namespace
         std::string id, name, dir, library;
         bool usable = true;
         bool bundled = false; // came in the APK (MainActivity.installBundledDrivers): not deletable
+        char family = 0;      // 'p' Mesa PanVK (Mali), 't' Mesa Turnip (Adreno), 0 not known
         std::string problem;
+    };
+
+    // Parches: one installed patch, as MainActivity's Patches.java lists it (internalDir/patches/
+    // lista.txt). status: activo, desactivado, reiniciar-on / reiniciar-off (its library changes at
+    // the next start), fallo (turned off after failed starts), carga (its library did not load),
+    // obsoleto, abi, gpu, api, base (see Patches.java).
+    struct PatchItem
+    {
+        std::string id, status, kinds, name, version, date, description;
+        bool official = false; // signed with the port's key
+        uint64_t bytes = 0;
     };
 
     // Comprobar (Sistema): walks the game folder on its own thread.
@@ -202,6 +217,11 @@ namespace
         std::vector<Save> saves;
         std::vector<Backup> backups;
         std::vector<Driver> drivers;
+        std::vector<PatchItem> patches;
+        std::vector<std::pair<std::string, std::string>> patchNotices; // reason (fallo, carga), name
+        std::string runningPatch;   // the patch whose library runs, empty for the APK's
+        bool patchRestart = false;  // a library change waits for the next start
+        bool patchBusy = false;     // Importar parche or an action is running in MainActivity
         std::vector<Notice> notices;
         bool noticesOpen = false;
         bool welcome = false; // the launcher opened without the game: Importa tu ISO over the home
@@ -277,6 +297,7 @@ namespace
     fs::path BackupDir() { return External() / "backups"; }
     fs::path GameDir() { return External() / "game"; }
     fs::path DriverDir() { return fs::path(GetPlatform().internalDir) / "drivers"; }
+    fs::path PatchDir() { return fs::path(GetPlatform().internalDir) / "patches"; }
 
     std::string ReadText(const fs::path& path, size_t limit = 1 << 20)
     {
@@ -429,12 +450,42 @@ namespace
         std::sort(g.backups.begin(), g.backups.end(), [](const Backup& a, const Backup& b) { return a.folder > b.folder; });
     }
 
+    // What an imported driver is, from the names of its debug variables in the library: 'p' Mesa
+    // PanVK (Mali), 't' Mesa Turnip (Adreno), 0 something else. Its file name doesn't say: GameHub's
+    // PanVK package calls it libvulkan_freedreno.so.
+    char DriverFamily(const std::string& path)
+    {
+        char family = 0;
+#ifdef __ANDROID__
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return 0;
+        struct stat info{};
+        if (fstat(fd, &info) == 0 && info.st_size > 0)
+        {
+            const size_t size = size_t(info.st_size);
+            void* data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (data != MAP_FAILED)
+            {
+                const auto has = [&](const char* text) { return memmem(data, size, text, strlen(text)) != nullptr; };
+                family = has("PANVK_DEBUG") ? 'p' : has("TU_DEBUG") ? 't' : 0;
+                munmap(data, size);
+            }
+        }
+        close(fd);
+#endif
+        return family;
+    }
+
     void ScanDrivers()
     {
         g.drivers.clear();
         std::error_code ec;
         for (const auto& entry : fs::directory_iterator(DriverDir(), ec))
         {
+            // .import and .bundled-<id>: a driver MainActivity is still unpacking.
+            if (const std::string folder = entry.path().filename().string(); folder.empty() || folder[0] == '.')
+                continue;
             const std::string meta = ReadText(entry.path() / "meta.json", 64 * 1024);
             if (meta.empty())
                 continue;
@@ -466,10 +517,72 @@ namespace
 #endif
             else if (major == 1 && minor < 2)
                 driver.problem = Trf("Vulkan {}.{}: necesita 1.2", major, minor);
+            if (driver.problem.empty())
+            {
+                // Each runs only on its own GPU's kernel driver (KGSL or Mali's kbase).
+                driver.family = DriverFamily(driver.dir + driver.library);
+                if (g.adreno && driver.family == 'p')
+                    driver.problem = Tr("Es un driver PanVK, para Mali");
+                else if (!g.adreno && driver.family == 't')
+                    driver.problem = Tr("Es un driver Turnip, para Adreno");
+            }
             driver.usable = driver.problem.empty();
             if (!driver.usable)
                 LOGFN_WARNING("launcher: driver {} not usable: {}", driver.id, driver.problem);
             g.drivers.push_back(std::move(driver));
+        }
+    }
+
+    // Patches.java's lista.txt (tab-separated): "#" what runs and whether a restart is needed, "!"
+    // a patch turned off at this start, then one line per patch, newest first.
+    void ScanPatches()
+    {
+        g.patches.clear();
+        g.patchNotices.clear();
+        g.runningPatch.clear();
+        g.patchRestart = false;
+        const std::string text = ReadText(PatchDir() / "lista.txt", 256 * 1024);
+        size_t start = 0;
+        while (start < text.size())
+        {
+            size_t end = text.find('\n', start);
+            if (end == std::string::npos)
+                end = text.size();
+            std::vector<std::string> fields;
+            for (size_t at = start; at <= end;)
+            {
+                size_t tab = text.find('\t', at);
+                if (tab == std::string::npos || tab > end)
+                    tab = end;
+                fields.push_back(text.substr(at, tab - at));
+                at = tab + 1;
+            }
+            start = end + 1;
+            if (fields.empty() || fields[0].empty())
+                continue;
+            if (fields[0] == "#" && fields.size() >= 5)
+            {
+                g.runningPatch = fields[3] == "-" ? std::string() : fields[3];
+                g.patchRestart = fields[4] == "1";
+            }
+            else if (fields[0] == "!" && fields.size() >= 3)
+            {
+                g.patchNotices.emplace_back(fields[1], fields[2]);
+            }
+            else if (fields.size() >= 9)
+            {
+                PatchItem patch;
+                patch.id = fields[0];
+                patch.status = fields[1];
+                patch.official = fields[2] == "1";
+                patch.kinds = fields[3];
+                patch.name = fields[4];
+                patch.version = fields[5];
+                patch.bytes = strtoull(fields[6].c_str(), nullptr, 10);
+                patch.date = fields[7];
+                patch.description = fields[8];
+                g.patches.push_back(std::move(patch));
+            }
         }
     }
 
@@ -620,7 +733,12 @@ namespace
     std::string ActiveDriver()
     {
         if (!g.adreno)
+        {
+            // Mali: the phone's driver, or an imported one (Mesa PanVK) when it was chosen.
+            if (const Driver* driver = ImportedDriver(g.config.driver); driver && driver->usable)
+                return g.config.driver;
             return "system";
+        }
         const std::string& chosen = g.config.driver;
         if (chosen == "system" && SystemDriverOk())
             return chosen;
@@ -674,19 +792,31 @@ namespace
         if (!g.gpu || !g.gpu->found)
         {
             g.notices.push_back({2, std::string(Tr("No se encontró una GPU con Vulkan")) +
-                (g.gpu && !g.gpu->missing.empty() ? " (" + g.gpu->missing + ")" : std::string()), Page::Gpu, !g.adreno});
+                (g.gpu && !g.gpu->missing.empty() ? " (" + g.gpu->missing + ")" : std::string()), Page::Gpu,
+                !g.adreno && ActiveDriver() == "system"});
         }
         else if (!g.gpu->missing.empty())
         {
-            if (!g.adreno)
+            // Mali with an imported driver (PanVK): the renderer checks that one when the game starts.
+            if (!g.adreno && ActiveDriver() == "system")
                 g.notices.push_back({2, Trf("Tu GPU no es compatible con el renderer: {}", g.gpu->missing), Page::Gpu, true});
+            else if (!g.adreno)
+                g.notices.push_back({0, Trf("Se usará {}: el driver del sistema no es compatible", DriverName(ActiveDriver())), Page::Gpu, false});
             else if (!g.turnipPresent)
                 g.notices.push_back({2, std::string(Tr("El driver del sistema no es compatible y falta Turnip en la APK")), Page::Gpu, true});
             else if (ActiveDriver() == "turnip")
                 g.notices.push_back({0, std::string(Tr("Se usará Turnip: el driver del sistema no es compatible")), Page::Gpu, false});
         }
-        if (g.adreno && g.config.driver != "auto" && ActiveDriver() != g.config.driver)
+        if (g.config.driver != "auto" && ActiveDriver() != g.config.driver)
             g.notices.push_back({1, Trf("El driver elegido no está disponible: se usará {}", DriverName(ActiveDriver())), Page::Gpu, false});
+        for (const auto& [reason, name] : g.patchNotices)
+        {
+            g.notices.push_back({1, reason == "fallo" ? Trf("Parche desactivado: {} cerraba el juego al arrancar", name)
+                                                      : Trf("Parche desactivado: {} no se pudo cargar", name),
+                Page::Patches, false});
+        }
+        if (g.patchRestart)
+            g.notices.push_back({0, std::string(Tr("Reinicia para aplicar los cambios de los parches")), Page::Patches, false});
         std::error_code ec;
         if (fs::is_regular_file(External() / "crash.txt", ec))
             g.notices.push_back({1, std::string(Tr("La última partida se cerró por un error: toca para ver el informe")), Page::Crash, false});
@@ -892,7 +1022,8 @@ namespace
         WriteSwitch("bg_pause", g.config.bgPause == 0 ? "1" : "0");
         std::error_code ec;
         const std::string driver = ActiveDriver();
-        if (!g.adreno || g.config.driver == "auto")
+        // Mali: no file for the phone's driver (as before PanVK), "custom" for an imported one.
+        if (g.adreno ? g.config.driver == "auto" : driver == "system")
             fs::remove(External() / "vk_driver", ec);
         else if (driver == "system" || driver == "turnip")
             WriteSwitch("vk_driver", driver);
@@ -979,6 +1110,8 @@ namespace
             ScanGame();
             BuildNotices();
         }
+        if (page == Page::Patches)
+            ScanPatches();
     }
 
     // ---------- drawing ----------
@@ -1670,17 +1803,21 @@ namespace
         Section(grid, "Driver Vulkan");
         if (!g.adreno)
         {
-            ChoiceRow(grid, "##system", "Driver del sistema", true, true, ok ? "Compatible" : "No compatible",
-                ok ? Rgba(40, 170, 90, 0.9f) : Rgba(220, 60, 60, 0.9f));
-            return;
+            // Mali: the phone's driver or an imported Mesa PanVK (vk_driver.cpp); no Automático or Turnip.
+            if (ChoiceRow(grid, "##system", "Driver del sistema", ActiveDriver() == "system", true, ok ? "Compatible" : "No compatible",
+                    ok ? Rgba(40, 170, 90, 0.9f) : Rgba(220, 60, 60, 0.9f)))
+                ChooseDriver("system");
         }
-        if (ChoiceRow(grid, "##auto", "Automático", g.config.driver == "auto", true, "", 0))
-            ChooseDriver("auto");
-        if (ChoiceRow(grid, "##system", "Driver del sistema", g.config.driver == "system", ok, ok ? "Compatible" : "No compatible",
-                ok ? Rgba(40, 170, 90, 0.9f) : Rgba(220, 60, 60, 0.9f)))
-            ChooseDriver("system");
-        if (ChoiceRow(grid, "##turnip", kTurnipName, g.config.driver == "turnip", g.turnipPresent, "Incluido", Accent(0.6f)))
-            ChooseDriver("turnip");
+        else
+        {
+            if (ChoiceRow(grid, "##auto", "Automático", g.config.driver == "auto", true, "", 0))
+                ChooseDriver("auto");
+            if (ChoiceRow(grid, "##system", "Driver del sistema", g.config.driver == "system", ok, ok ? "Compatible" : "No compatible",
+                    ok ? Rgba(40, 170, 90, 0.9f) : Rgba(220, 60, 60, 0.9f)))
+                ChooseDriver("system");
+            if (ChoiceRow(grid, "##turnip", kTurnipName, g.config.driver == "turnip", g.turnipPresent, "Incluido", Accent(0.6f)))
+                ChooseDriver("turnip");
+        }
         for (size_t i = 0; i < g.drivers.size(); ++i)
         {
             const Driver& driver = g.drivers[i];
@@ -1723,8 +1860,8 @@ namespace
             Card(a, a + ImVec2(width, height));
             const Icon importIcon = Icon::Import;
             const float button = ButtonWidth("Importar driver (.zip)", true);
-            Text(kBody, ImVec2(a.x + Dp(18), a.y + (height - FontSize(kBody)) / 2), White(0.85f), "Drivers Turnip para Adreno",
-                width - button - Dp(48));
+            Text(kBody, ImVec2(a.x + Dp(18), a.y + (height - FontSize(kBody)) / 2), White(0.85f),
+                g.adreno ? "Drivers Turnip para Adreno" : "Drivers PanVK para Mali (experimental)", width - button - Dp(48));
             if (Button("##import", ImVec2(a.x + width - Dp(16) - button, a.y + Dp(16)), button, "Importar driver (.zip)", &importIcon, Accent(0.85f)))
                 RequestDriverImport();
         }
@@ -1873,6 +2010,157 @@ namespace
                 ApplyLanguage();
                 Toast("Ajustes restablecidos");
             }
+        }
+    }
+
+    // A patch's status as its tag: the text and its colour.
+    std::pair<const char*, ImU32> PatchStatusTag(const std::string& status)
+    {
+        if (status == "activo") return {"Activo", Rgba(40, 170, 90, 0.9f)};
+        if (status == "reiniciar-on") return {"Se activa al reiniciar", Rgba(230, 150, 30, 0.9f)};
+        if (status == "reiniciar-off") return {"Se quita al reiniciar", Rgba(230, 150, 30, 0.9f)};
+        if (status == "fallo") return {"Desactivado por fallo", Rgba(220, 60, 60, 0.9f)};
+        if (status == "carga") return {"No se pudo cargar", Rgba(220, 60, 60, 0.9f)};
+        if (status == "obsoleto") return {"Ya incluido en el APK", White(0.2f)};
+        if (status == "abi") return {"Necesita un APK nuevo", Rgba(220, 60, 60, 0.9f)};
+        if (status == "gpu") return {"No es para esta GPU", Rgba(220, 60, 60, 0.9f)};
+        if (status == "api") return {"Necesita un Android más nuevo", Rgba(220, 60, 60, 0.9f)};
+        if (status == "base") return {"Para otra versión", Rgba(220, 60, 60, 0.9f)};
+        return {"Desactivado", White(0.2f)};
+    }
+
+    void PatchesPage(Grid& grid)
+    {
+        const bool available = PatchesAvailable();
+        // What runs, and Importar parche.
+        {
+            const float height = Dp(16) + Dp(46) + Dp(16), width = grid.CellWidth(2);
+            const ImVec2 a = grid.Place(height, 2);
+            Card(a, a + ImVec2(width, height));
+            const Icon importIcon = Icon::Import;
+            const char* label = g.patchBusy ? "Instalando…" : "Importar parche (.zip)";
+            const float button = std::max(ButtonWidth("Importar parche (.zip)", true), ButtonWidth("Instalando…", true));
+            std::string running;
+            for (const PatchItem& patch : g.patches)
+            {
+                if (patch.id == g.runningPatch)
+                    running = patch.name;
+            }
+            const float lines = FontSize(kBody) + Dp(6) + FontSize(kSmall);
+            const float y = a.y + (height - lines) / 2, textWidth = width - button - Dp(52);
+            Text(kBody, ImVec2(a.x + Dp(18), y), White(0.95f), Trf("Versión en uso: {}", GetPlatform().version), textWidth);
+            Text(kSmall, ImVec2(a.x + Dp(18), y + FontSize(kBody) + Dp(6)), White(0.65f),
+                !available ? std::string(Tr("Este APK no admite parches"))
+                : running.empty() ? std::string(Tr("Código del APK, sin parche"))
+                : Trf("Código del parche {}", running), textWidth);
+            if (Button("##importpatch", ImVec2(a.x + width - Dp(16) - button, a.y + Dp(16)), button, label, &importIcon, Accent(0.85f),
+                    available && !g.patchBusy))
+            {
+                g.patchBusy = true;
+                RequestPatchImport();
+            }
+        }
+        // A library change waits for the next start.
+        if (g.patchRestart)
+        {
+            const float height = Dp(16) + Dp(46) + Dp(16), width = grid.CellWidth(2);
+            const ImVec2 a = grid.Place(height, 2);
+            Card(a, a + ImVec2(width, height), Rgba(255, 170, 40, 0.12f));
+            const Icon restart = Icon::Restore;
+            const float button = ButtonWidth("Reiniciar ahora", true);
+            DrawIcon(Icon::Warning, ImVec2(a.x + Dp(30), a.y + height / 2), Dp(22), Rgba(255, 190, 60, 1));
+            Text(kBody, ImVec2(a.x + Dp(52), a.y + (height - FontSize(kBody)) / 2), White(0.95f),
+                "El código del juego cambia al reiniciar", width - button - Dp(86));
+            if (Button("##restart", ImVec2(a.x + width - Dp(16) - button, a.y + Dp(16)), button, "Reiniciar ahora", &restart,
+                    Rgba(255, 170, 40, 0.6f), !g.patchBusy))
+                RequestRestart();
+        }
+
+        Section(grid, g.patches.empty() ? "Parches instalados" : Trf("Parches instalados ({})", g.patches.size()).c_str());
+        if (g.patches.empty())
+        {
+            const ImVec2 a = grid.Place(Dp(72), 2);
+            Card(a, a + ImVec2(grid.CellWidth(2), Dp(72)));
+            Text(kBody, a + ImVec2(Dp(18), Dp(36) - FontSize(kBody) / 2), White(0.75f), "No hay parches instalados");
+        }
+        const float tagHeight = FontSize(kSmall) + Dp(8);
+        const float rowHeight = Dp(16) + FontSize(kBody) + Dp(10) + tagHeight + Dp(10) + FontSize(kSmall) + Dp(4) + FontSize(kSmall) +
+            Dp(14) + Dp(46) + Dp(14);
+        for (size_t i = 0; i < g.patches.size(); ++i)
+        {
+            const PatchItem& patch = g.patches[i];
+            const float width = grid.CellWidth();
+            const ImVec2 a = grid.Place(rowHeight);
+            const auto [statusText, statusFill] = PatchStatusTag(patch.status);
+            const bool bad = patch.status == "fallo" || patch.status == "carga";
+            Card(a, a + ImVec2(width, rowHeight), bad ? Rgba(255, 82, 82, 0.10f) : 0);
+            float y = a.y + Dp(16);
+            const std::string version = patch.version.empty() ? std::string() : "v" + patch.version;
+            const float versionWidth = version.empty() ? 0 : Measure(kBody, version).x + Dp(10);
+            Text(kBody, ImVec2(a.x + Dp(18), y), White(1), patch.name, width - Dp(36) - versionWidth);
+            if (!version.empty())
+                Text(kBody, ImVec2(a.x + width - Dp(18) - Measure(kBody, version).x, y), White(0.6f), version);
+            y += FontSize(kBody) + Dp(10);
+            // Tags: its status, who made it, what it changes.
+            float x = a.x + Dp(18);
+            const auto tag = [&](const std::string& text, ImU32 fill)
+            {
+                if (x + TagWidth(text) > a.x + width - Dp(18))
+                    return;
+                Tag(ImVec2(x, y), text, fill);
+                x += TagWidth(text) + Dp(8);
+            };
+            tag(std::string(Tr(statusText)), statusFill);
+            tag(std::string(Tr(patch.official ? "Oficial" : "No oficial")), patch.official ? Accent(0.6f) : Rgba(230, 150, 30, 0.8f));
+            for (const auto& [kind, label] : {std::pair{"lib", "Código"}, std::pair{"shaders", "Shaders"}, std::pair{"config", "Ajustes"}})
+            {
+                if (patch.kinds.find(kind) != std::string::npos)
+                    tag(std::string(Tr(label)), White(0.16f));
+            }
+            y += tagHeight + Dp(10);
+            Text(kSmall, ImVec2(a.x + Dp(18), y), White(0.8f),
+                patch.description.empty() ? std::string(Tr("Sin descripción")) : patch.description, width - Dp(36));
+            y += FontSize(kSmall) + Dp(4);
+            Text(kSmall, ImVec2(a.x + Dp(18), y), White(0.55f),
+                (patch.date.empty() ? std::string() : patch.date + " · ") + Size(patch.bytes), width - Dp(36));
+            // Activar / Desactivar and Borrar.
+            const float by = a.y + rowHeight - Dp(14) - Dp(46);
+            const float remove = ConfirmWidth("Borrar");
+            ImGui::PushID(int(i));
+            if (ConfirmButton("patch:" + patch.id, ImVec2(a.x + width - Dp(14) - remove, by), remove, "Borrar", Icon::Trash, true) &&
+                !g.patchBusy)
+            {
+                g.patchBusy = true;
+                RequestPatchAction("del:" + patch.id);
+            }
+            const bool on = patch.status == "activo" || patch.status == "reiniciar-on" || patch.status == "base";
+            const bool switchable = on || patch.status == "desactivado" || patch.status == "fallo" || patch.status == "carga" ||
+                patch.status == "reiniciar-off";
+            if (switchable)
+            {
+                const char* toggle = on ? "Desactivar" : "Activar";
+                const Icon icon = on ? Icon::Cross : Icon::Check;
+                const float button = std::max(ButtonWidth("Desactivar", true), ButtonWidth("Activar", true));
+                if (Button("##toggle", ImVec2(a.x + width - Dp(14) - remove - Dp(10) - button, by), button, toggle, &icon,
+                        on ? White(0.12f) : Accent(0.85f), !g.patchBusy))
+                {
+                    g.patchBusy = true;
+                    RequestPatchAction((on ? "off:" : "on:") + patch.id);
+                }
+            }
+            ImGui::PopID();
+        }
+        // How they work.
+        {
+            static const char* const kAbout = "Los parches cambian el juego sin reinstalar el APK. El juego del APK no se borra nunca: "
+                                              "al desactivar o borrar un parche se vuelve a él. Si el juego se cierra dos veces al "
+                                              "arrancar con un parche nuevo, se desactiva solo. Los parches oficiales van firmados; "
+                                              "uno sin firma solo puede cambiar ajustes del renderer.";
+            const float width = grid.CellWidth(2);
+            const float height = Dp(14) + Measure(kSmall, kAbout, width - Dp(36)).y + Dp(14);
+            const ImVec2 a = grid.Place(height, 2);
+            Card(a, a + ImVec2(width, height));
+            TextWrapped(kSmall, a + ImVec2(Dp(18), Dp(14)), White(0.7f), kAbout, width - Dp(36));
         }
     }
 
@@ -2139,6 +2427,7 @@ namespace
         case Page::Credits: return "Créditos";
         case Page::Crash: return "Informe de error";
         case Page::Games: return "Juego";
+        case Page::Patches: return "Parches";
         default: return "";
         }
     }
@@ -2223,6 +2512,7 @@ namespace
         case Page::Credits: CreditsPage(grid); break;
         case Page::Crash: CrashPage(grid); break;
         case Page::Games: GamesPage(grid); break;
+        case Page::Patches: PatchesPage(grid); break;
         default: break;
         }
         const float height = grid.End();
@@ -2284,14 +2574,15 @@ namespace
             Page page;
             int alert;
         };
-        int gpuAlert = -1, systemAlert = -1;
+        int gpuAlert = -1, patchAlert = -1, systemAlert = -1;
         for (const Notice& notice : g.notices)
         {
-            int& alert = notice.page == Page::Gpu ? gpuAlert : systemAlert;
+            int& alert = notice.page == Page::Gpu ? gpuAlert : notice.page == Page::Patches ? patchAlert : systemAlert;
             alert = std::max(alert, notice.level);
         }
+        // Parches where Juego was: Jugar already opens the game's page.
         const Entry entries[] = {
-            {"##game", Icon::Console, "Juego", Page::Games, -1},
+            {"##patches", Icon::Bolt, "Parches", Page::Patches, patchAlert},
             {"##saves", Icon::Saves, "Partidas", Page::Saves, -1},
 #if XPORT_TITLE_ID == 0x4D5308AB
             {"##gpu", Icon::Graphics, "Gráficos y GPU", Page::Gpu, gpuAlert},
@@ -2649,6 +2940,7 @@ void UiInit()
     ScanSaves();
     ScanBackups();
     ScanDrivers();
+    ScanPatches();
     BuildNotices();
     // Importa tu ISO, once: the first open without the game.
     g.welcome = g.game == 0 && !g.config.welcomeShown;
@@ -2779,6 +3071,9 @@ void UiDriverImported(const std::string& message, bool ok)
 {
     ScanDrivers();
     BuildNotices();
+    // MainActivity.installBundledDrivers unpacked or removed the APK's drivers: just the new list.
+    if (ok && message == "bundled")
+        return;
     if (ok)
     {
         Toast(Trf("Driver importado: {}", message));
@@ -2804,6 +3099,65 @@ void UiDriverImported(const std::string& message, bool ok)
             reason = Tr(known[1]);
     }
     Toast(Trf("No se pudo importar el driver: {}", reason), 2);
+}
+
+// Patches.java's answer to Importar parche or to Activar / Desactivar / Borrar.
+void UiPatchesChanged(const std::string& message, bool ok)
+{
+    g.patchBusy = false;
+    ScanPatches();
+    BuildNotices();
+    if (message == "cancel")
+        return;
+    const size_t tab = message.find('\t');
+    const std::string what = message.substr(0, tab), detail = tab == std::string::npos ? std::string() : message.substr(tab + 1);
+    if (ok)
+    {
+        if (what == "import")
+            Toast(Trf("Parche instalado: {}", detail));
+        else if (what == "on")
+            Toast(Trf("Parche activado: {}", detail));
+        else if (what == "off")
+            Toast(Trf("Parche desactivado: {}", detail));
+        else if (what == "del")
+            Toast(Trf("Parche borrado: {}", detail));
+        if (g.patchRestart)
+            Toast("Reinicia para aplicar el cambio", 1);
+        LOGFN("launcher: patches: {} {}", what, detail);
+        return;
+    }
+    if (detail == "picker")
+    {
+        Toast("No hay un selector de archivos en este móvil", 2);
+        return;
+    }
+    static const char* const reasons[][2] = {
+        {"zip", "el archivo no es un parche válido"},
+        {"tamano", "el parche es demasiado grande"},
+        {"integridad", "su contenido no coincide con el manifest (archivo dañado o cambiado)"},
+        {"manifest", "manifest.json no es válido"},
+        {"formato", "formato de parche no compatible"},
+        {"paquete", "es para otro juego"},
+        {"firma", "la firma no es válida"},
+        {"sin_firma", "un parche con código o shaders debe ir firmado"},
+        {"opciones", "lleva opciones no permitidas"},
+        {"vacio", "no contiene nada"},
+        {"abi", "necesita un APK más nuevo"},
+        {"obsoleto", "el APK ya incluye esta versión o una más nueva"},
+        {"gpu", "no es para esta GPU"},
+        {"api", "necesita un Android más nuevo"},
+        {"carpeta", "no se pudo guardar"},
+        {"mover", "no se pudo guardar"},
+        {"falta", "el parche ya no está"},
+    };
+    std::string reason = detail;
+    for (const auto& known : reasons)
+    {
+        if (detail == known[0])
+            reason = Tr(known[1]);
+    }
+    LOGFN_WARNING("launcher: patches: {}", message);
+    Toast(Trf("Parche no aplicado: {}", reason), 2);
 }
 
 // MainActivity's answer to Importar ISO: the disc image's descriptor, or -1 and why.

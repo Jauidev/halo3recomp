@@ -53,6 +53,12 @@ namespace launcher
 
     // Quits and starts the app again.
     void RequestRestart();
+    // Parches (MainActivity / Patches.java, files in internalDir/patches): the file picker for a
+    // patch .zip, and "on:<id>", "off:<id>" or "del:<id>"; both answer with UiPatchesChanged.
+    // PatchesAvailable: false in an APK whose Java side has no patches.
+    void RequestPatchImport();
+    void RequestPatchAction(const std::string& action);
+    bool PatchesAvailable();
 #if XPORT_TITLE_ID == 0x4D5308AB || XPORT_TITLE_ID == 0x4D5307E6
     // Puts text on the phone's clipboard (MainActivity.launcherCopyText): Copiar in Último error.
     void RequestCopyText(const std::string& text);
@@ -88,6 +94,8 @@ namespace launcher
     void UiInputSource(bool touch);                // the last input was a touch (or a key)
     void UiGamepad(const std::string& name);       // empty: none connected
     void UiDriverImported(const std::string& message, bool ok);
+    // Patches.java's answer: "import|on|off|del\t<name>", "error\t<code>", or "cancel".
+    void UiPatchesChanged(const std::string& message, bool ok);
     // The picked disc image's descriptor, or -1 and why (picker, open).
     void UiIsoPicked(int fd, const std::string& message);
     // The display cutout's safe insets in pixels (the camera hole): the grid keeps clear of them.
